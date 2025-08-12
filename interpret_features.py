@@ -26,7 +26,7 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 
 from data_loader import create_data_loaders
-from sparse_autoencoder import SparseAutoencoder
+from sparse_autoencoder import GatedSparseAutoencoder
 
 # Load environment variables
 load_dotenv()
@@ -54,7 +54,7 @@ class FeatureInterpreter:
         print(f"Feature interpreter initialized")
         print(f"Model latent dimension: {self.model.latent_dim}")
     
-    def _load_model(self) -> SparseAutoencoder:
+    def _load_model(self) -> GatedSparseAutoencoder:
         """Load the trained sparse autoencoder model."""
         # Force CPU mapping and use safe globals for PyTorch 2.6 compatibility
         with torch.serialization.safe_globals([
@@ -80,16 +80,13 @@ class FeatureInterpreter:
         ecg_input_dim = total_input_dim - 4
         timing_features_dim = 4
         
-        # Create model with loaded configuration
-        model = SparseAutoencoder(
+        # Create gated model (unused legacy keys safely ignored)
+        model = GatedSparseAutoencoder(
             ecg_input_dim=ecg_input_dim,
             timing_features_dim=timing_features_dim,
             hidden_dims=config.get('hidden_dims', [2048, 1024, 512]),
             latent_dim=config.get('latent_dim', 256),
-            sparsity_weight=config.get('sparsity_weight', 0.01),
-            kl_weight=config.get('kl_weight', 0.0),
-            target_sparsity=config.get('target_sparsity', 0.05),
-            dropout_rate=config.get('dropout_rate', 0.2)
+            sparsity_weight=config.get('sparsity_weight', 0.01)
         )
         
         # Load model state
@@ -109,7 +106,7 @@ class FeatureInterpreter:
         with torch.no_grad():
             for batch in dataloader:
                 x = batch['combined_features'].to(self.device)
-                _, latent = self.model(x)
+                _, latent = self.model(x)  # gated model returns (reconstruction, h)
                 
                 # Get activations for specific feature
                 feature_acts = latent[:, feature_idx].cpu().numpy()
@@ -303,15 +300,11 @@ Key Word: <your key word or expression>
         for interp in interpretations:
             feature_idx = interp['feature_idx']
             summary = interp.get('summary', 'No summary available')
-            confidence = interp.get('confidence', 'Unknown')
-            key_terms = interp.get('key_terms', 'Unknown')
-            
+            key_word = interp.get('key_word', 'Unknown')
             report_lines.extend([
                 f"### Feature {feature_idx} (Rank #{interp['activity_rank']})",
+                f"**Key Word:** {key_word}",
                 f"**Summary:** {summary}",
-                f"**Clinical Pattern:** {interp.get('clinical_pattern', 'Unknown')}",
-                f"**Key Terms:** {key_terms}",
-                f"**Confidence:** {confidence}",
                 f"**Activity Level:** {interp['mean_activity']:.4f}",
                 ""
             ])

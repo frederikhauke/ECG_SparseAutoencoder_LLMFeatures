@@ -26,7 +26,7 @@ except ImportError:
     raise SystemExit("Install NeuroKit2: pip install neurokit2")
 
 from data_loader import PTBXLDataset
-from sparse_autoencoder import SparseAutoencoder
+from sparse_autoencoder import GatedSparseAutoencoder
 from tools.timing_extractor import get_timing_extractor
 
 
@@ -310,18 +310,15 @@ def main():
     timing_features_dim = 4
     
     # Import here to avoid circular import
-    from sparse_autoencoder import SparseAutoencoder
+    from sparse_autoencoder import GatedSparseAutoencoder
     
     # Create model with loaded configuration
-    model = SparseAutoencoder(
+    model = GatedSparseAutoencoder(
         ecg_input_dim=ecg_input_dim,
         timing_features_dim=timing_features_dim,
         hidden_dims=config.get('hidden_dims', [2048, 1024, 512]),
         latent_dim=config.get('latent_dim', 256),
-        sparsity_weight=config.get('sparsity_weight', 0.01),
-        kl_weight=config.get('kl_weight', 0.0),
-        target_sparsity=config.get('target_sparsity', 0.05),
-        dropout_rate=config.get('dropout_rate', 0.2)
+        sparsity_weight=config.get('sparsity_weight', 0.01)
     )
     
     # Load model state
@@ -358,7 +355,7 @@ def main():
         
         # Forward pass through model
         with torch.no_grad():
-            reconstruction, latent = model(combined_tensor)
+            _, latent = model(combined_tensor)
             feature_activations = latent.squeeze(0).cpu().numpy()
         
         # Find top activating features
@@ -370,13 +367,10 @@ def main():
             interpretation_info = ""
             if feat_idx in feature_interpretations:
                 interp = feature_interpretations[feat_idx]
-                clinical_text = interp.get('full_interpretation', 'No interpretation available')
-                confidence = interp.get('confidence_score', 0)
-                interpretation_info = f" | {clinical_text[:80]}{'...' if len(clinical_text) > 80 else ''} (confidence: {confidence:.2f})"
-            
+                key_word = interp.get('key_word', '')
+                summary = interp.get('summary', '')
+                interpretation_info = f" | {key_word} | {summary[:60]}{'...' if len(summary) > 60 else ''}"
             print(f"  Feature {feat_idx}: {activation:.4f}{interpretation_info}")
-            # print full interpretation
-            print(f"    Full interpretation: {clinical_text}")
 
         # Get report
         report = str(row_meta.get('report', '')).strip()
