@@ -1,0 +1,48 @@
+{
+  "data": {
+    "data_path": "physionet.org/files/ptb-xl/1.0.3/",
+    "sampling_rate": 100,
+    "test_fold": 10,
+    "max_samples": null,
+    "normalize": true
+  },
+  
+  "model": {
+    "hidden_dims": [2048, 1024, 512],
+    "latent_dim": 256,
+    "sparsity_weight": 0.01,
+    "kl_weight": 0.0,
+    "target_sparsity": 0.05,
+    "dropout_rate": 0.2
+  },
+  
+  "training": {
+    "batch_size": 32,
+    "num_epochs": 100,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "patience": 15,
+    "save_dir": "checkpoints"
+  },
+  
+  "analysis": {
+    "top_k_features": 10,
+    "top_k_samples": 20,
+    "activation_threshold": 0.1,
+    "min_activation_for_analysis": 0.05
+  },
+  
+  "azure_openai": {
+    "use_azure": true,
+    "temperature": 0.3,
+    "max_tokens": 1000,
+    "backup_interpreter": true
+  },
+  
+  "output": {
+    "save_plots": true,
+    "save_json": true,
+    "save_html_report": true,
+    "plot_dpi": 300
+  }
+}

@@ -1,0 +1,52 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+venv/
+.env
+.venv/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Logs
+*.log
+Logs_*.out
+Logs_*.err
+
+# Model checkpoints and training artifacts
+checkpoints/
+*.pth
+*.pt
+
+# Generated feature interpretation outputs
+feature_interpretations.json
+feature_interpretations_report.md
+plots/
+
+# Dataset (PhysioNet PTB-XL local mirror)
+physionet.org/
+
+# Large data exports
+*.csv
+!times.csv  # Keep specific timing CSV if needed
+
+# Download / cache directories
+.cache/
+.tmp/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Security
+*.env
+
+# Misc
+*.bak

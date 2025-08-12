@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=radcluster
+#SBATCH --gres=gpu:1
+#SBATCH --output=Logs_thorax_multilabel_all.out  # Save standard output to this file
+#SBATCH --error=Logs_thorax_multilabel_all.err   # Save standard error to this file
+#SBATCH --time=168:00:00
+#SBATCH --mem=200G  
+ 
+#Use this to change to the directory where you have the files you want to run.
+#if the batch file is in the same folder as the files you want ot run then
+#leave it as it is
+cd /home/homesOnMaster/fhauke/ECG
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING=1
+export PYTHONUNBUFFERED=1
+
+source /home/homesOnMaster/fhauke/miniconda3/etc/profile.d/conda.sh
+conda activate ecg
+
+export PYTHONPATH=/home/homesOnMaster/fhauke/ECG
+ #python tests/data/test_dataset.py
+
+python train.py
+

@@ -1,0 +1,5 @@
+- switch to gated SAE
+- switch to transformer architecture (DINO? 1D?)
+- find a better dataset with measured times
+- apply GRPO for measuring the times
+
