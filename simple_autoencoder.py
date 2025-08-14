@@ -16,81 +16,88 @@ class SimpleAutoencoder(nn.Module):
     
     def __init__(self, heartbeat_input_dim: int, hidden_dims: list, latent_dim: int,
                  sparsity_weight: float = 0.0, use_frozen_decoder_for_aux: bool = False,
-                 alpha_aux: float = 0.0, target_sparsity: float = 0.0):
+                 alpha_aux: float = 0.0, target_sparsity: float = 0.0,
+                 sparsity_warmup_steps: int = 1000):
         super().__init__()
         self.input_dim = heartbeat_input_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         
-        # Keep these for compatibility but don't use them
-        self.sparsity_weight = sparsity_weight
+        # Sparsity warm-up parameters
+        self.initial_sparsity_weight = sparsity_weight
+        self.sparsity_weight = 0.0  # Start at 0 and warm up
+        self.sparsity_warmup_steps = sparsity_warmup_steps
+        self.current_step = 0
+        
+        # Keep these for compatibility
         self.use_frozen_decoder_for_aux = use_frozen_decoder_for_aux
         self.alpha_aux = alpha_aux
         self.target_sparsity = target_sparsity
         
-        # CNN Encoder
+        # CNN Encoder - designed for multi-lead heartbeats (12 leads * 3 beats * 75 samples = 2700)
+        # More memory-efficient with smaller channel dimensions
         self.encoder = nn.Sequential(
-            # First conv block: capture local patterns
-            nn.Conv1d(1, 32, kernel_size=15, stride=2, padding=7),  # 225 -> 112
+            # First conv block: capture local beat patterns
+            nn.Conv1d(1, 32, kernel_size=31, stride=4, padding=15),  # 2700 -> 675
             nn.ReLU(),
             nn.BatchNorm1d(32),
             
-            # Second conv block: wider patterns
-            nn.Conv1d(32, 64, kernel_size=11, stride=2, padding=5),  # 112 -> 56
+            # Second conv block: beat-to-beat patterns
+            nn.Conv1d(32, 64, kernel_size=15, stride=3, padding=7),  # 675 -> 225
             nn.ReLU(),
             nn.BatchNorm1d(64),
             
-            # Third conv block: even wider patterns  
-            nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),  # 56 -> 28
+            # Third conv block: lead integration patterns  
+            nn.Conv1d(64, 128, kernel_size=9, stride=3, padding=4),  # 225 -> 75
             nn.ReLU(),
             nn.BatchNorm1d(128),
             
-            # Fourth conv block: global features
-            nn.Conv1d(128, 256, kernel_size=5, stride=2, padding=2),  # 29 -> 15
+            # Fourth conv block: high-level features
+            nn.Conv1d(128, 256, kernel_size=5, stride=3, padding=2),  # 75 -> 25
             nn.ReLU(),
             nn.BatchNorm1d(256),
             
             # Flatten and final linear layers
-            nn.Flatten(),  # 256 * 15 = 3840
-            nn.Linear(256 * 15, hidden_dims[0] if hidden_dims else 512),
+            nn.Flatten(),  # 256 * 25 = 6400
+            nn.Linear(256 * 25, hidden_dims[0] if hidden_dims else 512),
             nn.ReLU(),
             nn.Linear(hidden_dims[0] if hidden_dims else 512, latent_dim),
             nn.ReLU()  # Keep latent activations positive for compatibility
         )
         
-        # CNN Decoder (transpose convolutions)
+        # CNN Decoder (transpose convolutions) - reverse of encoder
         self.decoder = nn.Sequential(
             # Linear layers to expand back to conv feature map
             nn.Linear(latent_dim, hidden_dims[0] if hidden_dims else 512),
             nn.ReLU(),
-            nn.Linear(hidden_dims[0] if hidden_dims else 512, 256 * 15),
+            nn.Linear(hidden_dims[0] if hidden_dims else 512, 256 * 25),
             nn.ReLU(),
             
             # Reshape for transpose convolutions
-            # This will be handled in forward pass: view(-1, 256, 15)
+            # This will be handled in forward pass: view(-1, 256, 25)
             
         )
         
         # Transpose convolution layers (defined separately for easier reshaping)
         self.decoder_conv = nn.Sequential(
-            # First transpose conv block
-            nn.ConvTranspose1d(256, 128, kernel_size=5, stride=2, padding=2, output_padding=1),  # 15 -> 29
+            # First transpose conv block: 25 -> 75
+            nn.ConvTranspose1d(256, 128, kernel_size=5, stride=3, padding=2, output_padding=2),
             nn.ReLU(),
             nn.BatchNorm1d(128),
             
-            # Second transpose conv block
-            nn.ConvTranspose1d(128, 64, kernel_size=7, stride=2, padding=3, output_padding=1),  # 29 -> 57
+            # Second transpose conv block: 75 -> 225
+            nn.ConvTranspose1d(128, 64, kernel_size=9, stride=3, padding=4, output_padding=2),
             nn.ReLU(),
             nn.BatchNorm1d(64),
             
-            # Third transpose conv block
-            nn.ConvTranspose1d(64, 32, kernel_size=11, stride=2, padding=5, output_padding=1),  # 57 -> 113
+            # Third transpose conv block: 225 -> 675
+            nn.ConvTranspose1d(64, 32, kernel_size=15, stride=3, padding=7, output_padding=2),
             nn.ReLU(),
             nn.BatchNorm1d(32),
             
-            # Final transpose conv block - back to original size
-            nn.ConvTranspose1d(32, 1, kernel_size=15, stride=2, padding=7, output_padding=0),  # 120 -> 225
-            nn.AdaptiveAvgPool1d(225)  # Ensure exactly 225 length
+            # Final transpose conv block: 675 -> 2700
+            nn.ConvTranspose1d(32, 1, kernel_size=31, stride=4, padding=15, output_padding=3),
+            nn.Sigmoid()  # Normalize output to [0, 1] to match input scaling
         )
         
         # Initialize weights
@@ -134,8 +141,8 @@ class SimpleAutoencoder(nn.Module):
         # Pass through linear decoder layers
         x = self.decoder(h)
         
-        # Reshape for transpose convolutions: (batch_size, 256, 15)
-        x = x.view(-1, 256, 15)
+        # Reshape for transpose convolutions: (batch_size, 256, 25)
+        x = x.view(-1, 256, 25)
         
         # Pass through transpose convolutions
         x = self.decoder_conv(x)
@@ -201,6 +208,22 @@ class SimpleAutoencoder(nn.Module):
     def refresh_frozen_decoder(self):
         """Placeholder for compatibility with GatedSparseAutoencoder interface."""
         pass  # No frozen decoder in simple autoencoder
+    
+    def update_sparsity_weight(self):
+        """Update sparsity weight with linear warm-up schedule."""
+        if self.current_step < self.sparsity_warmup_steps:
+            # Linear warm-up from 0 to initial_sparsity_weight
+            progress = self.current_step / self.sparsity_warmup_steps
+            self.sparsity_weight = progress * self.initial_sparsity_weight
+        else:
+            # After warm-up, use full sparsity weight
+            self.sparsity_weight = self.initial_sparsity_weight
+        
+        self.current_step += 1
+    
+    def get_current_sparsity_weight(self):
+        """Get current sparsity weight for monitoring."""
+        return self.sparsity_weight
     
     def extract_timing_features(self, ecg_signal: np.ndarray, sampling_rate: int = 100, 
                                ecg_id: Optional[int] = None) -> np.ndarray:

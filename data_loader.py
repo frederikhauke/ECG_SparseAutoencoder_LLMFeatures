@@ -120,8 +120,13 @@ class PTBXLDataset(Dataset):
     
     def get_heartbeat_dim(self):
         """Get the dimension of simplified heartbeat input."""
-        # 3 beats * 750ms * sampling_rate/1000
-        return 3 * int(750 * self.sampling_rate / 1000)
+        # Calculate expected heartbeat dimension: num_leads * num_beats * beat_duration_samples
+        num_leads = self.signals.shape[2] if len(self.signals.shape) == 3 else 12  # Default to 12 leads
+        num_beats = 3
+        beat_duration_samples = int(750 * self.sampling_rate / 1000)  # 750ms in samples
+        
+        # Return actual heartbeat dimension from loaded data
+        return self.heartbeats.shape[1]
 
 
 def create_data_loaders(preprocessed_path: str, batch_size: int = 32, 

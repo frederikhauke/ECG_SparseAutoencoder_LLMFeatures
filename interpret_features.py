@@ -13,6 +13,7 @@ Usage: python interpret_features.py --model_path checkpoints/best_model.pth
 
 import argparse
 import torch
+from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -25,8 +26,9 @@ from collections import Counter
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
-from data_loader import create_data_loaders
+from data_loader import create_data_loaders, PTBXLDataset
 from sparse_autoencoder import GatedSparseAutoencoder
+from simple_autoencoder import SimpleAutoencoder
 
 # Load environment variables
 load_dotenv()
@@ -35,14 +37,20 @@ load_dotenv()
 class FeatureInterpreter:
     """Interprets sparse autoencoder features using Azure OpenAI."""
     
-    def __init__(self, model_path: str, data_path: str, device: str = 'cpu'):
+    def __init__(self, model_path: str, preprocessed_path: str, config_path: str = None, 
+                 original_data_path: str = None, device: str = 'cpu'):
         """Initialize the feature interpreter."""
         self.model_path = model_path
-        self.data_path = data_path
+        self.preprocessed_path = preprocessed_path
+        self.config_path = config_path
+        self.original_data_path = original_data_path
         self.device = device
         
+        # Load configuration
+        self.config = self._load_config()
+        
         # Load model
-        self.model = self._load_model()
+        self.model, self.model_type = self._load_model()
         
         # Setup Azure OpenAI
         self.client = AzureOpenAI(
@@ -52,10 +60,31 @@ class FeatureInterpreter:
         )
         
         print(f"Feature interpreter initialized")
+        print(f"Model type: {self.model_type}")
         print(f"Model latent dimension: {self.model.latent_dim}")
     
-    def _load_model(self) -> GatedSparseAutoencoder:
-        """Load the trained sparse autoencoder model."""
+    def _load_config(self) -> dict:
+        """Load configuration from JSON file."""
+        if self.config_path and os.path.exists(self.config_path):
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+            print(f"Loaded config from {self.config_path}")
+            return config
+        else:
+            print("No config file provided or found, using defaults")
+            return {
+                "model": {
+                    "hidden_dims": [1024, 512],
+                    "latent_dim": 256,
+                    "sparsity_weight": 0.001,
+                    "alpha_aux": 0.0,
+                    "target_sparsity": 0.0,
+                    "use_frozen_decoder_for_aux": False
+                }
+            }
+    
+    def _load_model(self) -> Tuple[torch.nn.Module, str]:
+        """Load the trained autoencoder model (sparse or simple)."""
         # Force CPU mapping and use safe globals for PyTorch 2.6 compatibility
         with torch.serialization.safe_globals([
             np._core.multiarray.scalar, 
@@ -72,29 +101,61 @@ class FeatureInterpreter:
         ]):
             checkpoint = torch.load(self.model_path, map_location='cpu')
         
-        # Extract model configuration
-        config = checkpoint.get('model_config', {})
+        # Extract model configuration from checkpoint and external config
+        checkpoint_config = checkpoint.get('model_config', {})
+        external_model_config = self.config.get('model', {})
         
-        # Calculate ECG and timing dimensions from total input dimension
-        total_input_dim = config.get('input_dim', 12004)  # 12000 ECG + 4 timing features
-        ecg_input_dim = total_input_dim - 4
-        timing_features_dim = 4
+        # External config takes priority over checkpoint config
+        combined_config = {**checkpoint_config, **external_model_config}
         
-        # Create gated model (unused legacy keys safely ignored)
-        model = GatedSparseAutoencoder(
-            ecg_input_dim=ecg_input_dim,
-            timing_features_dim=timing_features_dim,
-            hidden_dims=config.get('hidden_dims', [2048, 1024, 512]),
-            latent_dim=config.get('latent_dim', 256),
-            sparsity_weight=config.get('sparsity_weight', 0.01)
-        )
+        # Get heartbeat input dimension from preprocessed data
+        test_dataset = PTBXLDataset(self.preprocessed_path, self.original_data_path, max_samples=1)
+        heartbeat_input_dim = test_dataset.get_heartbeat_dim()
+        
+        print(f"Detected heartbeat input dimension: {heartbeat_input_dim}")
+        
+        # Detect model type from checkpoint or config
+        model_type = external_model_config.get('type') or self._detect_model_type(checkpoint)
+        
+        # Create appropriate model using combined configuration
+        model_args = {
+            'heartbeat_input_dim': heartbeat_input_dim,
+            'hidden_dims': combined_config.get('hidden_dims', [1024, 512]),
+            'latent_dim': combined_config.get('latent_dim', 256),
+            'sparsity_weight': combined_config.get('sparsity_weight', 0.01),
+            'alpha_aux': combined_config.get('alpha_aux', 0.02),
+            'target_sparsity': combined_config.get('target_sparsity', 0.1),
+            'use_frozen_decoder_for_aux': combined_config.get('use_frozen_decoder_for_aux', True)
+        }
+        
+        if model_type == 'simple':
+            model = SimpleAutoencoder(**model_args)
+        else:
+            model = GatedSparseAutoencoder(**model_args)
         
         # Load model state
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         model.to(self.device)
         
-        return model
+        return model, model_type
+    
+    def _detect_model_type(self, checkpoint) -> str:
+        """Detect whether checkpoint is from sparse or simple autoencoder."""
+        state_dict = checkpoint.get('model_state_dict', {})
+        
+        # Check for GatedSparseAutoencoder specific parameters
+        sparse_keys = ['W_gate', 'b_gate', 'r_mag', 'b_mag']
+        if any(key in state_dict for key in sparse_keys):
+            return 'sparse'
+        
+        # Check for SimpleAutoencoder specific parameters (CNN layers)
+        simple_keys = ['encoder.0.weight', 'decoder_conv.0.weight']
+        if any(key in state_dict for key in simple_keys):
+            return 'simple'
+        
+        # Default to sparse
+        return 'sparse'
     
     def find_max_activating_samples(self, feature_idx: int, dataloader, 
                                    top_k: int = 20) -> List[Tuple[int, float, str]]:
@@ -105,8 +166,8 @@ class FeatureInterpreter:
         
         with torch.no_grad():
             for batch in dataloader:
-                x = batch['combined_features'].to(self.device)
-                _, latent = self.model(x)  # gated model returns (reconstruction, h)
+                x = batch['heartbeats'].to(self.device)  # Use heartbeats from preprocessed data
+                x_hat, latent = self.model(x)  # Both sparse and simple models return (reconstruction, latent)
                 
                 # Get activations for specific feature
                 feature_acts = latent[:, feature_idx].cpu().numpy()
@@ -115,7 +176,7 @@ class FeatureInterpreter:
                 for i, activation in enumerate(feature_acts):
                     idx_in_batch = i
                     report = batch['report'][idx_in_batch]
-                    ecg_id = batch['ecg_id'][idx_in_batch].item()
+                    ecg_id = batch['ecg_id'][idx_in_batch].item() if hasattr(batch['ecg_id'][idx_in_batch], 'item') else batch['ecg_id'][idx_in_batch]
                     
                     activations.append(activation)
                     sample_data.append((ecg_id, report))
@@ -196,11 +257,12 @@ Key Word: <your key word or expression>
     def interpret_all_features(self, top_k_features: int = 20, samples_per_feature: int = 20) -> List[Dict]:
         """Interpret the top k most active features."""
         
-        # Create data loader
-        train_loader, _, _ = create_data_loaders(
-            self.data_path, 
+        # Create dataset and data loader using preprocessed data
+        dataset = PTBXLDataset(self.preprocessed_path, split='train')
+        train_loader = DataLoader(
+            dataset, 
             batch_size=32, 
-            max_samples=1000  # Limit for efficiency
+            shuffle=False
         )
         
         # First, find which features are most active overall
@@ -209,8 +271,8 @@ Key Word: <your key word or expression>
         
         with torch.no_grad():
             for batch in train_loader:
-                x = batch['combined_features'].to(self.device)
-                _, latent = self.model(x)
+                x = batch['heartbeats'].to(self.device)  # Use heartbeats from preprocessed data
+                x_hat, latent = self.model(x)  # Both sparse and simple models return (reconstruction, latent)
                 all_activations.append(latent.cpu().numpy())
         
         # Combine all activations
@@ -320,8 +382,12 @@ def main():
     parser = argparse.ArgumentParser(description="Interpret ECG Sparse Autoencoder Features")
     parser.add_argument("--model_path", default="checkpoints/best_model.pth",
                        help="Path to trained model")
+    parser.add_argument("--config_path", default="config_simple.json",
+                       help="Path to model configuration file")
+    parser.add_argument("--preprocessed_path", default="outputs/preprocessed_data",
+                       help="Preprocessed data path")
     parser.add_argument("--data_path", default="physionet.org/files/ptb-xl/1.0.3/",
-                       help="PTB-XL dataset path")
+                       help="PTB-XL dataset path (for metadata)")
     parser.add_argument("--top_features", type=int, default=15,
                        help="Number of top features to interpret")
     parser.add_argument("--samples_per_feature", type=int, default=20,
@@ -340,7 +406,7 @@ def main():
     print(f"Using device: {device}")
     
     # Create interpreter
-    interpreter = FeatureInterpreter(args.model_path, args.data_path, device)
+    interpreter = FeatureInterpreter(args.model_path, args.preprocessed_path, args.config_path, args.data_path, device)
     
     # Interpret features
     interpretations = interpreter.interpret_all_features(

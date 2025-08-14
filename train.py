@@ -50,6 +50,10 @@ class ECGAutoencoderTrainer:
             
             optimizer.zero_grad()
             
+            # Update sparsity weight for warm-up (if using SimpleAutoencoder)
+            if isinstance(self.model, SimpleAutoencoder):
+                self.model.update_sparsity_weight()
+            
             # Forward pass and loss (use GatedSparseAutoencoder interface)
             losses = self.model.loss(x, lambda_sparsity=self.model.sparsity_weight)
             total_loss_batch = losses['loss']
@@ -64,12 +68,17 @@ class ECGAutoencoderTrainer:
             total_l1_loss += losses['L_sparsity'].item()
             total_kl_loss += losses['L_aux'].item()
             num_batches += 1
-            pbar.set_postfix({
+            
+            # Update progress bar with current sparsity weight for SimpleAutoencoder
+            postfix = {
                 'loss': f'{total_loss_batch.item():.4f}',
                 'recon': f'{losses["L_recon"].item():.4f}',
                 'l1': f'{losses["L_sparsity"].item():.4f}',
                 'aux': f'{losses["L_aux"].item():.4f}'
-            })
+            }
+            if isinstance(self.model, SimpleAutoencoder):
+                postfix['sparsity_w'] = f'{self.model.get_current_sparsity_weight():.6f}'
+            pbar.set_postfix(postfix)
         
         return {
             'total_loss': total_loss / num_batches,
@@ -350,6 +359,7 @@ def main():
     }
     
     if model_type == 'simple':
+        model_args['sparsity_warmup_steps'] = config.get('sparsity_warmup_steps', 1000)
         model = SimpleAutoencoder(**model_args)
     elif model_type == 'sparse':
         model = GatedSparseAutoencoder(**model_args)

@@ -124,29 +124,31 @@ def load_feature_interpretations(filename: str = 'feature_interpretations.json')
 
 
 def extract_heartbeats_with_timing(ecg_signal: np.ndarray, sampling_rate: int = 100) -> dict:
-    """Extract 3 representative heartbeats and basic timing info for visualization."""
+    """Extract 3 representative heartbeats from ALL leads and basic timing info for visualization."""
     try:
-        # Extract heartbeats using the same function as the data loader
+        # Extract heartbeats using the same function as preprocessing (now multi-lead)
         heartbeats = extract_representative_heartbeats(
             ecg_signal,
             sampling_rate=sampling_rate,
-            lead_idx=1,  # Lead II
+            detection_lead_idx=1,  # Use Lead II for R-peak detection
             num_beats=3,
             beat_duration_ms=750,
             qrs_offset_ms=100
         )
         
-        # Also extract R peaks for basic visualization
+        # Also extract R peaks for basic visualization using Lead II
         ecg_1d = ecg_signal[:, 1] if ecg_signal.ndim == 2 and ecg_signal.shape[1] > 1 else ecg_signal.flatten()
         signals, info = nk.ecg_process(ecg_1d, sampling_rate=sampling_rate)
         r_peaks = info["ECG_R_Peaks"]
         
-        # Calculate beat duration in samples
-        beat_samples = int(750 * sampling_rate / 1000)  # 750ms
+        # Calculate beat duration in samples and number of leads
+        beat_samples = int(750 * sampling_rate / 1000)  # 750ms per beat
+        num_leads = ecg_signal.shape[1] if ecg_signal.ndim == 2 else 1
         
         return {
             'heartbeats': heartbeats,
             'beat_samples': beat_samples,
+            'num_leads': num_leads,
             'r_peaks': r_peaks[:3] if len(r_peaks) >= 3 else r_peaks,
             'ecg_clean': ecg_1d,
             'success': True
@@ -156,11 +158,13 @@ def extract_heartbeats_with_timing(ecg_signal: np.ndarray, sampling_rate: int = 
         print(f"Heartbeat extraction failed: {e}")
         # Return zeros as fallback
         beat_samples = int(750 * sampling_rate / 1000)
+        num_leads = ecg_signal.shape[1] if ecg_signal.ndim == 2 else 1
         return {
-            'heartbeats': np.zeros(3 * beat_samples),
+            'heartbeats': np.zeros(num_leads * 3 * beat_samples),
             'beat_samples': beat_samples,
+            'num_leads': num_leads,
             'r_peaks': [],
-            'ecg_clean': ecg_signal[:, 1] if ecg_signal.ndim == 2 else ecg_signal.flatten(),
+            'ecg_clean': ecg_1d if ecg_signal.ndim == 2 else ecg_signal.flatten(),
             'success': False
         }
 
@@ -173,32 +177,66 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
                                  sparse_reconstructed_heartbeats: np.ndarray = None,
                                  full_mse: float = None,
                                  sparse_mse: float = None):
-    """Plot 3 heartbeats and their reconstructions with feature activations."""
+    """Plot 3 heartbeats (Lead II only for visualization) and their reconstructions with feature activations."""
     
     heartbeats = heartbeats_data['heartbeats']
     beat_samples = heartbeats_data['beat_samples']
+    num_leads = heartbeats_data.get('num_leads', 12)  # Default to 12 leads
     
-    # Split heartbeats into individual beats
-    beat1 = heartbeats[:beat_samples]
-    beat2 = heartbeats[beat_samples:2*beat_samples]
-    beat3 = heartbeats[2*beat_samples:3*beat_samples]
+    # Extract Lead II heartbeats for visualization (lead index 1)
+    # Multi-lead structure: lead0_beat1, lead0_beat2, lead0_beat3, lead1_beat1, lead1_beat2, lead1_beat3, ...
+    lead_ii_idx = 1  # Lead II is at index 1
+    lead_ii_start = lead_ii_idx * 3 * beat_samples
+    lead_ii_end = lead_ii_start + (3 * beat_samples)
     
-    # Split reconstructed heartbeats if provided
+    if lead_ii_start < len(heartbeats):
+        lead_ii_heartbeats = heartbeats[lead_ii_start:lead_ii_end]
+        
+        # Split Lead II heartbeats into individual beats
+        beat1 = lead_ii_heartbeats[:beat_samples]
+        beat2 = lead_ii_heartbeats[beat_samples:2*beat_samples]
+        beat3 = lead_ii_heartbeats[2*beat_samples:3*beat_samples]
+    else:
+        # Fallback: if multi-lead structure is different, use first part
+        print("Warning: Could not extract Lead II from multi-lead data, using first lead")
+        beat1 = heartbeats[:beat_samples] if len(heartbeats) >= beat_samples else heartbeats
+        beat2 = heartbeats[beat_samples:2*beat_samples] if len(heartbeats) >= 2*beat_samples else beat1
+        beat3 = heartbeats[2*beat_samples:3*beat_samples] if len(heartbeats) >= 3*beat_samples else beat1
+    
+    # Split reconstructed heartbeats (also extract Lead II for visualization)
     recon_beats = []
     sparse_recon_beats = []
     if reconstructed_heartbeats is not None:
-        recon_beats = [
-            reconstructed_heartbeats[:beat_samples],
-            reconstructed_heartbeats[beat_samples:2*beat_samples],
-            reconstructed_heartbeats[2*beat_samples:3*beat_samples]
-        ]
+        if lead_ii_start < len(reconstructed_heartbeats):
+            recon_lead_ii = reconstructed_heartbeats[lead_ii_start:lead_ii_end]
+            recon_beats = [
+                recon_lead_ii[:beat_samples],
+                recon_lead_ii[beat_samples:2*beat_samples],
+                recon_lead_ii[2*beat_samples:3*beat_samples]
+            ]
+        else:
+            # Fallback
+            recon_beats = [
+                reconstructed_heartbeats[:beat_samples],
+                reconstructed_heartbeats[beat_samples:2*beat_samples] if len(reconstructed_heartbeats) >= 2*beat_samples else reconstructed_heartbeats[:beat_samples],
+                reconstructed_heartbeats[2*beat_samples:3*beat_samples] if len(reconstructed_heartbeats) >= 3*beat_samples else reconstructed_heartbeats[:beat_samples]
+            ]
     
     if sparse_reconstructed_heartbeats is not None:
-        sparse_recon_beats = [
-            sparse_reconstructed_heartbeats[:beat_samples],
-            sparse_reconstructed_heartbeats[beat_samples:2*beat_samples],
-            sparse_reconstructed_heartbeats[2*beat_samples:3*beat_samples]
-        ]
+        if lead_ii_start < len(sparse_reconstructed_heartbeats):
+            sparse_recon_lead_ii = sparse_reconstructed_heartbeats[lead_ii_start:lead_ii_end]
+            sparse_recon_beats = [
+                sparse_recon_lead_ii[:beat_samples],
+                sparse_recon_lead_ii[beat_samples:2*beat_samples],
+                sparse_recon_lead_ii[2*beat_samples:3*beat_samples]
+            ]
+        else:
+            # Fallback
+            sparse_recon_beats = [
+                sparse_reconstructed_heartbeats[:beat_samples],
+                sparse_reconstructed_heartbeats[beat_samples:2*beat_samples] if len(sparse_reconstructed_heartbeats) >= 2*beat_samples else sparse_reconstructed_heartbeats[:beat_samples],
+                sparse_reconstructed_heartbeats[2*beat_samples:3*beat_samples] if len(sparse_reconstructed_heartbeats) >= 3*beat_samples else sparse_reconstructed_heartbeats[:beat_samples]
+            ]
     
     # Time axis for each beat (750ms)
     beat_time = np.arange(beat_samples) * 1000 / sampling_rate  # in milliseconds
@@ -281,41 +319,46 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
         ax_act.text(feat_idx, activation + max(feature_activations) * 0.05, 
                    f'F{feat_idx}', ha='center', va='bottom', fontsize=8, fontweight='bold')
     
-    # Reconstruction comparison plot
-    if reconstructed_heartbeats is not None:
-        full_time = np.arange(len(heartbeats)) * 1000 / sampling_rate
-        ax_recon.plot(full_time, heartbeats, 'b-', linewidth=1.0, label='Original Heartbeats', alpha=0.8)
-        ax_recon.plot(full_time, reconstructed_heartbeats, 'r--', linewidth=1.0, label='Reconstructed', alpha=0.8)
+    # Reconstruction comparison plot (showing Lead II only for clarity)
+    if reconstructed_heartbeats is not None and lead_ii_start < len(reconstructed_heartbeats):
+        lead_ii_heartbeats_full = heartbeats[lead_ii_start:lead_ii_end] if lead_ii_start < len(heartbeats) else heartbeats[:3*beat_samples]
+        recon_lead_ii_full = reconstructed_heartbeats[lead_ii_start:lead_ii_end] if lead_ii_start < len(reconstructed_heartbeats) else reconstructed_heartbeats[:3*beat_samples]
+        
+        full_time = np.arange(len(lead_ii_heartbeats_full)) * 1000 / sampling_rate
+        ax_recon.plot(full_time, lead_ii_heartbeats_full, 'b-', linewidth=1.0, label='Original Lead II', alpha=0.8)
+        ax_recon.plot(full_time, recon_lead_ii_full, 'r--', linewidth=1.0, label='Reconstructed Lead II', alpha=0.8)
         
         # Mark beat boundaries
         for i in range(1, 3):
             boundary_ms = i * 750
             ax_recon.axvline(boundary_ms, color='gray', linestyle=':', alpha=0.5)
-            ax_recon.text(boundary_ms, max(heartbeats) * 0.9, f'Beat {i+1}', 
+            ax_recon.text(boundary_ms, max(lead_ii_heartbeats_full) * 0.9, f'Beat {i+1}', 
                          rotation=90, va='top', ha='right', fontsize=8, alpha=0.7)
         
         mse_text = f"MSE: {full_mse:.5f}" if full_mse is not None else ""
-        ax_recon.set_title(f'Full Reconstruction (All Features)  {mse_text}')
+        ax_recon.set_title(f'Full Reconstruction - Lead II Only (All {len(feature_activations)} Features)  {mse_text}')
         ax_recon.set_xlabel('Time (ms)')
         ax_recon.set_ylabel('Amplitude')
         ax_recon.legend()
         ax_recon.grid(True, alpha=0.3)
     
-    # Plot sparse reconstruction (top 5 features only)
-    if sparse_reconstructed_heartbeats is not None:
-        full_time = np.arange(len(heartbeats)) * 1000 / sampling_rate
-        ax_sparse_recon.plot(full_time, heartbeats, 'b-', linewidth=1.0, label='Original Heartbeats', alpha=0.8)
-        ax_sparse_recon.plot(full_time, sparse_reconstructed_heartbeats, 'g--', linewidth=1.5, label='Top-5 Features Reconstruction', alpha=0.9)
+    # Plot sparse reconstruction (top 5 features only, Lead II)
+    if sparse_reconstructed_heartbeats is not None and ax_sparse_recon is not None and lead_ii_start < len(sparse_reconstructed_heartbeats):
+        sparse_recon_lead_ii_full = sparse_reconstructed_heartbeats[lead_ii_start:lead_ii_end] if lead_ii_start < len(sparse_reconstructed_heartbeats) else sparse_reconstructed_heartbeats[:3*beat_samples]
+        
+        full_time = np.arange(len(lead_ii_heartbeats_full)) * 1000 / sampling_rate
+        ax_sparse_recon.plot(full_time, lead_ii_heartbeats_full, 'b-', linewidth=1.0, label='Original Lead II', alpha=0.8)
+        ax_sparse_recon.plot(full_time, sparse_recon_lead_ii_full, 'g--', linewidth=1.5, label='Top-5 Features Reconstruction', alpha=0.9)
         
         # Mark beat boundaries
         for i in range(1, 3):
             boundary_ms = i * 750
             ax_sparse_recon.axvline(boundary_ms, color='gray', linestyle=':', alpha=0.5)
-            ax_sparse_recon.text(boundary_ms, max(heartbeats) * 0.9, f'Beat {i+1}', 
+            ax_sparse_recon.text(boundary_ms, max(lead_ii_heartbeats_full) * 0.9, f'Beat {i+1}', 
                                 rotation=90, va='top', ha='right', fontsize=8, alpha=0.7)
         
         sparse_mse_text = f"MSE: {sparse_mse:.5f}" if sparse_mse is not None else ""
-        ax_sparse_recon.set_title(f'Sparse Reconstruction (Top-5 Features Only)  {sparse_mse_text}')
+        ax_sparse_recon.set_title(f'Sparse Reconstruction - Lead II Only (Top-5 Features)  {sparse_mse_text}')
         ax_sparse_recon.set_xlabel('Time (ms)')
         ax_sparse_recon.set_ylabel('Amplitude')
         ax_sparse_recon.legend()
@@ -443,8 +486,9 @@ def main():
     # Extract model configuration
     config = checkpoint.get('model_config', {})
     
-    # Get heartbeat input dimension (3 beats * 750ms * sampling_rate / 1000)
-    heartbeat_input_dim = config.get('heartbeat_input_dim', 225)  # Default for 100Hz
+    # Get heartbeat input dimension from dataset
+    heartbeat_input_dim = dataset.get_heartbeat_dim()  # Now returns multi-lead dimension
+    print(f"Heartbeat input dimension: {heartbeat_input_dim} (12 leads × 3 beats × 75 samples)")
     
     # Create appropriate model based on checkpoint type
     model = create_model_from_checkpoint(checkpoint, heartbeat_input_dim, config)
@@ -474,12 +518,12 @@ def main():
         heartbeats_data = extract_heartbeats_with_timing(ecg_signal_2d, sampling_rate=100)
         
         if heartbeats_data['success']:
-            print(f"Successfully extracted {3} heartbeats from Lead II")
+            print(f"Successfully extracted {3} heartbeats from all {heartbeats_data['num_leads']} leads (showing Lead II for visualization)")
             if heartbeats_data['r_peaks'] is not None and len(heartbeats_data['r_peaks']) > 0:
                 avg_hr = 60 / (np.mean(np.diff(heartbeats_data['r_peaks'])) / 100) if len(heartbeats_data['r_peaks']) > 1 else 70
                 print(f"Estimated heart rate: {avg_hr:.0f} bpm")
         else:
-            print("Warning: Heartbeat extraction failed, using fallback data")
+            print("Warning: Multi-lead heartbeat extraction failed, using fallback data")
         
         # Use heartbeats from the sample (as processed by dataset)
         heartbeats = sample['heartbeats'].numpy()

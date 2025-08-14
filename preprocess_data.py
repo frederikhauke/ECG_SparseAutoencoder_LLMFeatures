@@ -23,31 +23,32 @@ import threading
 
 
 def extract_representative_heartbeats(signal_2d: np.ndarray, sampling_rate: int = 100, 
-                                    lead_idx: int = 1, num_beats: int = 3, 
+                                    detection_lead_idx: int = 1, num_beats: int = 3, 
                                     beat_duration_ms: int = 750, 
                                     qrs_offset_ms: int = 100) -> np.ndarray:
     """
-    Extract representative heartbeats from a specific ECG lead.
+    Extract representative heartbeats from ALL ECG leads.
     
     Args:
         signal_2d: ECG signal matrix (samples x leads)
         sampling_rate: Sampling rate in Hz
-        lead_idx: Lead index to extract from (1 for lead II)
-        num_beats: Number of heartbeats to extract
+        detection_lead_idx: Lead index to use for R-peak detection (1 for lead II)
+        num_beats: Number of heartbeats to extract per lead
         beat_duration_ms: Duration of each heartbeat in milliseconds
         qrs_offset_ms: Offset from QRS peak to center the beat (ms)
         
     Returns:
-        Array of shape (num_beats * beat_duration_samples,) containing concatenated heartbeats
+        Array of shape (num_leads * num_beats * beat_duration_samples,) containing concatenated heartbeats from all leads
     """
     try:
         import neurokit2 as nk
         
-        # Get the specified lead (default lead II)
-        ecg_1d = signal_2d[:, lead_idx] if signal_2d.shape[1] > lead_idx else signal_2d[:, 0]
+        # Use specified lead for R-peak detection (default Lead II)
+        detection_lead = detection_lead_idx if signal_2d.shape[1] > detection_lead_idx else 0
+        ecg_detection = signal_2d[:, detection_lead]
         
-        # Process ECG to find R peaks
-        signals, info = nk.ecg_process(ecg_1d, sampling_rate=sampling_rate)
+        # Process ECG to find R peaks using the detection lead
+        signals, info = nk.ecg_process(ecg_detection, sampling_rate=sampling_rate)
         r_peaks = info["ECG_R_Peaks"]
         
         if len(r_peaks) < num_beats:
@@ -55,7 +56,7 @@ def extract_representative_heartbeats(signal_2d: np.ndarray, sampling_rate: int 
             if len(r_peaks) == 0:
                 # No peaks found, return zeros
                 beat_samples = int(beat_duration_ms * sampling_rate / 1000)
-                return np.zeros(num_beats * beat_samples)
+                return np.zeros(signal_2d.shape[1] * num_beats * beat_samples)
             else:
                 # Repeat available peaks to get required number
                 r_peaks = np.tile(r_peaks, (num_beats // len(r_peaks) + 1))[:num_beats]
@@ -64,45 +65,51 @@ def extract_representative_heartbeats(signal_2d: np.ndarray, sampling_rate: int 
         beat_samples = int(beat_duration_ms * sampling_rate / 1000)  # 750ms in samples
         qrs_offset_samples = int(qrs_offset_ms * sampling_rate / 1000)  # 100ms offset
         
-        # Extract beats centered 100ms after QRS
-        heartbeats = []
-        clean_signal = signals["ECG_Clean"]
+        # Extract beats from ALL leads
+        all_heartbeats = []
         
-        for i in range(num_beats):
-            if i < len(r_peaks):
-                r_peak = r_peaks[i]
-                # Center the beat 100ms after R peak
-                start_idx = r_peak + qrs_offset_samples - beat_samples // 2
-                end_idx = start_idx + beat_samples
-                
-                # Handle edge cases
-                if start_idx < 0:
-                    # Pad with zeros at the beginning
-                    beat = np.zeros(beat_samples)
-                    valid_start = 0
-                    beat[abs(start_idx):] = clean_signal[0:end_idx]
-                elif end_idx > len(clean_signal):
-                    # Pad with zeros at the end
-                    beat = np.zeros(beat_samples)
-                    valid_end = len(clean_signal) - start_idx
-                    beat[:valid_end] = clean_signal[start_idx:len(clean_signal)]
+        for lead_idx in range(signal_2d.shape[1]):  # Process each lead
+            lead_signal = signal_2d[:, lead_idx]
+            lead_heartbeats = []
+            
+            for i in range(num_beats):
+                if i < len(r_peaks):
+                    r_peak = r_peaks[i]
+                    # Center the beat 100ms after R peak
+                    start_idx = r_peak + qrs_offset_samples - beat_samples // 2
+                    end_idx = start_idx + beat_samples
+                    
+                    # Handle edge cases
+                    if start_idx < 0:
+                        # Pad with zeros at the beginning
+                        beat = np.zeros(beat_samples)
+                        valid_start = 0
+                        beat[abs(start_idx):] = lead_signal[0:end_idx]
+                    elif end_idx > len(lead_signal):
+                        # Pad with zeros at the end
+                        beat = np.zeros(beat_samples)
+                        valid_end = len(lead_signal) - start_idx
+                        beat[:valid_end] = lead_signal[start_idx:len(lead_signal)]
+                    else:
+                        # Normal case
+                        beat = lead_signal[start_idx:end_idx]
+                    
+                    lead_heartbeats.append(beat)
                 else:
-                    # Normal case
-                    beat = clean_signal[start_idx:end_idx]
-                
-                heartbeats.append(beat)
-            else:
-                # If we run out of peaks, duplicate the last one
-                heartbeats.append(heartbeats[-1].copy())
+                    # If we run out of peaks, duplicate the last one
+                    lead_heartbeats.append(lead_heartbeats[-1].copy())
+            
+            # Add this lead's heartbeats to the collection
+            all_heartbeats.extend(lead_heartbeats)
         
-        # Concatenate all heartbeats
-        return np.concatenate(heartbeats)
+        # Concatenate all heartbeats from all leads
+        return np.concatenate(all_heartbeats)
         
     except Exception as e:
         print(f"Error extracting heartbeats: {e}")
         # Return zeros as fallback
         beat_samples = int(beat_duration_ms * sampling_rate / 1000)
-        return np.zeros(num_beats * beat_samples)
+        return np.zeros(signal_2d.shape[1] * num_beats * beat_samples)
 
 
 def process_single_ecg(args):
@@ -125,11 +132,11 @@ def process_single_ecg(args):
         # Load ECG signal
         signal, _ = wfdb.rdsamp(str(signal_path))
         
-        # Extract heartbeats
+        # Extract heartbeats from ALL leads
         heartbeats = extract_representative_heartbeats(
             signal, 
             sampling_rate=sampling_rate,
-            lead_idx=1,  # Lead II
+            detection_lead_idx=1,  # Use Lead II for R-peak detection
             num_beats=3,
             beat_duration_ms=750,
             qrs_offset_ms=100
@@ -310,7 +317,7 @@ def main():
                         help='Maximum value for normalization range')
     parser.add_argument('--config', type=str, default="config.json",
                         help='JSON config file to load parameters from')
-    parser.add_argument('--max_workers', type=int, default=16,
+    parser.add_argument('--max_workers', type=int, default=32,
                         help='Maximum number of worker threads (default: 16)')
     
     args = parser.parse_args()

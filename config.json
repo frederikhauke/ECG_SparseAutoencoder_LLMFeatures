@@ -10,8 +10,8 @@
   
   "model": {
     "type": "sparse",
-    "hidden_dims": [512, 256],
-    "latent_dim": 128,
+    "hidden_dims": [1024, 512],
+    "latent_dim": 256,
     "sparsity_weight": 0.01,
     "alpha_aux": 0.02,
     "target_sparsity": 0.1,
