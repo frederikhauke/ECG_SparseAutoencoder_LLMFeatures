@@ -13,15 +13,15 @@
     "hidden_dims": [512, 256],
     "latent_dim": 128,
     "sparsity_weight": 0.001,
-    "alpha_aux": 0.0,
-    "target_sparsity": 0.0,
+    "alpha_aux": 0.1,
+    "target_sparsity": 0.3,
     "use_frozen_decoder_for_aux": false,
     "k_frozen_update": 200
   },
   
   "training": {
     "batch_size": 16,
-    "num_epochs": 50,
+    "num_epochs": 150,
     "learning_rate": 0.001,
     "weight_decay": 0.0001,
     "patience": 15,

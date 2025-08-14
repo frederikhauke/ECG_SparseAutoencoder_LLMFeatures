@@ -16,7 +16,7 @@ class SimpleAutoencoder(nn.Module):
     
     def __init__(self, heartbeat_input_dim: int, hidden_dims: list, latent_dim: int,
                  sparsity_weight: float = 0.0, use_frozen_decoder_for_aux: bool = False,
-                 alpha_aux: float = 0.0, target_sparsity: float = 0.0,
+                 alpha_aux: float = 0.0, target_sparsity: float = 0.3,
                  sparsity_warmup_steps: int = 1000):
         super().__init__()
         self.input_dim = heartbeat_input_dim
@@ -33,6 +33,9 @@ class SimpleAutoencoder(nn.Module):
         self.use_frozen_decoder_for_aux = use_frozen_decoder_for_aux
         self.alpha_aux = alpha_aux
         self.target_sparsity = target_sparsity
+        
+        # Reconstruction weight to prioritize reconstruction over sparsity
+        self.reconstruction_weight = 10.0  # Weight reconstruction 10x more than sparsity
         
         # CNN Encoder - designed for multi-lead heartbeats (12 leads * 3 beats * 75 samples = 2700)
         # More memory-efficient with smaller channel dimensions
@@ -190,11 +193,17 @@ class SimpleAutoencoder(nn.Module):
         else:
             L_sparsity = torch.tensor(0.0, device=x.device)
         
-        # Auxiliary loss set to zero for compatibility
-        L_aux = torch.tensor(0.0, device=x.device)
+        # Target sparsity loss - encourage activations to match target sparsity level
+        current_sparsity = (h > 0.1).float().mean()  # Fraction of activations > 0.1
+        target_sparsity_val = target_sparsity if target_sparsity is not None else self.target_sparsity
+        L_target_sparsity = F.mse_loss(current_sparsity, torch.tensor(target_sparsity_val, device=x.device))
+        
+        # Auxiliary loss combines sparsity losses for compatibility
+        L_aux = L_target_sparsity
         alpha_aux_val = alpha_aux if alpha_aux is not None else self.alpha_aux
         
-        total_loss = L_recon + L_sparsity
+        # Weight reconstruction much more heavily than sparsity
+        total_loss = self.reconstruction_weight * L_recon + L_sparsity + alpha_aux_val * L_aux
         
         return {
             "loss": total_loss,

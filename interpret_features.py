@@ -207,6 +207,7 @@ Based on these reports, please provide ONLY the following in your response:
 1. Summary: A concise summary of what this feature represents, in at most 2 sentences.
 2. Key Word: A single clinical key word or short expression (1-3 words) that best describes what this feature detects.
 
+In general please concentrate on the similarities in the reports!
 Format your response as:
 Summary: <your summary>
 Key Word: <your key word or expression>
@@ -254,11 +255,11 @@ Key Word: <your key word or expression>
                 'num_reports_analyzed': len(reports)
             }
     
-    def interpret_all_features(self, top_k_features: int = 20, samples_per_feature: int = 20) -> List[Dict]:
+    def interpret_all_features(self, top_k_features: int = 20, samples_per_feature: int = 25) -> List[Dict]:
         """Interpret the top k most active features."""
         
         # Create dataset and data loader using preprocessed data
-        dataset = PTBXLDataset(self.preprocessed_path, split='train')
+        dataset = PTBXLDataset(self.preprocessed_path)
         train_loader = DataLoader(
             dataset, 
             batch_size=32, 
@@ -293,7 +294,13 @@ Key Word: <your key word or expression>
             )
             
             # Extract reports
-            reports = [sample[2] for sample in top_samples if isinstance(sample[2], str) and len(sample[2].strip()) > 10]
+            all_reports_from_samples = [sample[2] for sample in top_samples]
+            valid_reports = [sample[2] for sample in top_samples if isinstance(sample[2], str) and len(sample[2].strip()) > 10]
+            
+            print(f"DEBUG: Found {len(top_samples)} top samples, {len(all_reports_from_samples)} total reports, {len(valid_reports)} valid reports")
+            print(f"DEBUG: Sample reports: {all_reports_from_samples[:5]}")
+            
+            reports = valid_reports
             
             if len(reports) < 3:
                 print(f"Skipping feature {feature_idx} - too few valid reports")
@@ -384,13 +391,13 @@ def main():
                        help="Path to trained model")
     parser.add_argument("--config_path", default="config_simple.json",
                        help="Path to model configuration file")
-    parser.add_argument("--preprocessed_path", default="outputs/preprocessed_data",
+    parser.add_argument("--preprocessed_path", default="preprocessed_data",
                        help="Preprocessed data path")
     parser.add_argument("--data_path", default="physionet.org/files/ptb-xl/1.0.3/",
                        help="PTB-XL dataset path (for metadata)")
     parser.add_argument("--top_features", type=int, default=15,
                        help="Number of top features to interpret")
-    parser.add_argument("--samples_per_feature", type=int, default=20,
+    parser.add_argument("--samples_per_feature", type=int, default=25,
                        help="Number of top-activating samples per feature")
     
     args = parser.parse_args()

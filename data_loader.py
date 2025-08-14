@@ -63,6 +63,24 @@ class PTBXLDataset(Dataset):
         if 'ecg_id' in self.metadata.columns:
             self.metadata = self.metadata.set_index('ecg_id')
         
+        # Filter out ECGs with zero-only heartbeat data
+        print("Filtering out ECGs with zero-only heartbeat data...")
+        valid_indices = []
+        for i, heartbeat in enumerate(self.heartbeats):
+            # Check if heartbeat contains any non-zero values
+            if np.any(heartbeat != 0):
+                valid_indices.append(i)
+        
+        if len(valid_indices) < len(self.heartbeats):
+            print(f"Filtered out {len(self.heartbeats) - len(valid_indices)} ECGs with zero-only heartbeat data")
+            self.signals = self.signals[valid_indices]
+            self.heartbeats = self.heartbeats[valid_indices]
+            self.metadata = self.metadata.iloc[valid_indices].reset_index()
+            
+            # Re-set ecg_id as index after reset
+            if 'ecg_id' in self.metadata.columns:
+                self.metadata = self.metadata.set_index('ecg_id')
+        
         # Limit samples if specified
         if max_samples and max_samples < len(self.signals):
             self.signals = self.signals[:max_samples]
