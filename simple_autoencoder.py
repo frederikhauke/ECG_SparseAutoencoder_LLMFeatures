@@ -28,49 +28,86 @@ class SimpleAutoencoder(nn.Module):
         self.alpha_aux = alpha_aux
         self.target_sparsity = target_sparsity
         
-        # Build encoder
-        encoder_layers = []
-        prev_dim = self.input_dim
+        # CNN Encoder
+        self.encoder = nn.Sequential(
+            # First conv block: capture local patterns
+            nn.Conv1d(1, 32, kernel_size=15, stride=2, padding=7),  # 225 -> 112
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            
+            # Second conv block: wider patterns
+            nn.Conv1d(32, 64, kernel_size=11, stride=2, padding=5),  # 112 -> 56
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            
+            # Third conv block: even wider patterns  
+            nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),  # 56 -> 28
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            
+            # Fourth conv block: global features
+            nn.Conv1d(128, 256, kernel_size=5, stride=2, padding=2),  # 29 -> 15
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            
+            # Flatten and final linear layers
+            nn.Flatten(),  # 256 * 15 = 3840
+            nn.Linear(256 * 15, hidden_dims[0] if hidden_dims else 512),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0] if hidden_dims else 512, latent_dim),
+            nn.ReLU()  # Keep latent activations positive for compatibility
+        )
         
-        # Hidden layers
-        for hidden_dim in hidden_dims:
-            encoder_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU()
-            ])
-            prev_dim = hidden_dim
+        # CNN Decoder (transpose convolutions)
+        self.decoder = nn.Sequential(
+            # Linear layers to expand back to conv feature map
+            nn.Linear(latent_dim, hidden_dims[0] if hidden_dims else 512),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0] if hidden_dims else 512, 256 * 15),
+            nn.ReLU(),
+            
+            # Reshape for transpose convolutions
+            # This will be handled in forward pass: view(-1, 256, 15)
+            
+        )
         
-        # Final encoder layer to latent space
-        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
-        encoder_layers.append(nn.ReLU())  # Keep latent activations positive for compatibility
-        
-        self.encoder = nn.Sequential(*encoder_layers)
-        
-        # Build decoder
-        decoder_layers = []
-        prev_dim = latent_dim
-        
-        # Reverse hidden layers
-        for hidden_dim in reversed(hidden_dims):
-            decoder_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU()
-            ])
-            prev_dim = hidden_dim
-        
-        # Final decoder layer back to input dimension
-        decoder_layers.append(nn.Linear(prev_dim, self.input_dim))
-        
-        self.decoder = nn.Sequential(*decoder_layers)
+        # Transpose convolution layers (defined separately for easier reshaping)
+        self.decoder_conv = nn.Sequential(
+            # First transpose conv block
+            nn.ConvTranspose1d(256, 128, kernel_size=5, stride=2, padding=2, output_padding=1),  # 15 -> 29
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            
+            # Second transpose conv block
+            nn.ConvTranspose1d(128, 64, kernel_size=7, stride=2, padding=3, output_padding=1),  # 29 -> 57
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            
+            # Third transpose conv block
+            nn.ConvTranspose1d(64, 32, kernel_size=11, stride=2, padding=5, output_padding=1),  # 57 -> 113
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            
+            # Final transpose conv block - back to original size
+            nn.ConvTranspose1d(32, 1, kernel_size=15, stride=2, padding=7, output_padding=0),  # 120 -> 225
+            nn.AdaptiveAvgPool1d(225)  # Ensure exactly 225 length
+        )
         
         # Initialize weights
         self._initialize_weights()
     
     def _initialize_weights(self):
-        """Initialize weights using Xavier initialization."""
+        """Initialize weights using appropriate initialization for CNN and linear layers."""
         for module in self.modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu'))
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
     
     def encode(self, x: Tensor):
@@ -79,6 +116,10 @@ class SimpleAutoencoder(nn.Module):
         Returns tuple for compatibility with GatedSparseAutoencoder interface:
         (pre_gate, RA, mag, h) where for simple autoencoder all are the same latent representation.
         """
+        # Reshape input for CNN: (batch_size, 1, sequence_length)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # Add channel dimension
+        
         h = self.encoder(x)
         # Return the same latent representation for all outputs to maintain interface compatibility
         return h, h, h, h
@@ -90,7 +131,19 @@ class SimpleAutoencoder(nn.Module):
             h: Latent representation
             use_frozen: Ignored in simple autoencoder (for compatibility)
         """
-        return self.decoder(h)
+        # Pass through linear decoder layers
+        x = self.decoder(h)
+        
+        # Reshape for transpose convolutions: (batch_size, 256, 15)
+        x = x.view(-1, 256, 15)
+        
+        # Pass through transpose convolutions
+        x = self.decoder_conv(x)
+        
+        # Flatten back to original shape: (batch_size, sequence_length)
+        x = x.squeeze(1)  # Remove channel dimension
+        
+        return x
     
     def forward(self, x: Tensor):
         """Forward pass through the autoencoder.
@@ -107,29 +160,34 @@ class SimpleAutoencoder(nn.Module):
     
     def loss(self, x: Tensor, lambda_sparsity: float = 0.0, sae_rad_style: bool = False, 
              alpha_aux: float = None, target_sparsity: float = None):
-        """Compute loss - simplified to only reconstruction loss.
+        """Compute loss with reconstruction and sparsity components.
         
         Args:
             x: Input tensor
-            lambda_sparsity: Ignored in simple autoencoder
+            lambda_sparsity: Weight for sparsity loss (L1 penalty on latent activations)
             sae_rad_style: Ignored in simple autoencoder
-            alpha_aux: Ignored in simple autoencoder
+            alpha_aux: Ignored in simple autoencoder  
             target_sparsity: Ignored in simple autoencoder
             
         Returns:
-            Dictionary with loss components (for compatibility)
+            Dictionary with loss components
         """
         x_hat, h = self.forward(x)
         
-        # Only reconstruction loss for simple autoencoder
+        # Reconstruction loss
         L_recon = F.mse_loss(x_hat, x, reduction="mean")
         
-        # Set other losses to zero for compatibility
-        L_sparsity = torch.tensor(0.0, device=x.device)
+        # Sparsity loss (L1 penalty on latent activations)
+        if lambda_sparsity > 0:
+            L_sparsity = lambda_sparsity * h.abs().mean()
+        else:
+            L_sparsity = torch.tensor(0.0, device=x.device)
+        
+        # Auxiliary loss set to zero for compatibility
         L_aux = torch.tensor(0.0, device=x.device)
         alpha_aux_val = alpha_aux if alpha_aux is not None else self.alpha_aux
         
-        total_loss = L_recon
+        total_loss = L_recon + L_sparsity
         
         return {
             "loss": total_loss,

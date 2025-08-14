@@ -170,7 +170,9 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
                                  feature_interpretations: dict = None,
                                  sampling_rate: int = 100, save_path: str = None,
                                  reconstructed_heartbeats: np.ndarray = None,
-                                 mse: float = None):
+                                 sparse_reconstructed_heartbeats: np.ndarray = None,
+                                 full_mse: float = None,
+                                 sparse_mse: float = None):
     """Plot 3 heartbeats and their reconstructions with feature activations."""
     
     heartbeats = heartbeats_data['heartbeats']
@@ -183,11 +185,19 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
     
     # Split reconstructed heartbeats if provided
     recon_beats = []
+    sparse_recon_beats = []
     if reconstructed_heartbeats is not None:
         recon_beats = [
             reconstructed_heartbeats[:beat_samples],
             reconstructed_heartbeats[beat_samples:2*beat_samples],
             reconstructed_heartbeats[2*beat_samples:3*beat_samples]
+        ]
+    
+    if sparse_reconstructed_heartbeats is not None:
+        sparse_recon_beats = [
+            sparse_reconstructed_heartbeats[:beat_samples],
+            sparse_reconstructed_heartbeats[beat_samples:2*beat_samples],
+            sparse_reconstructed_heartbeats[2*beat_samples:3*beat_samples]
         ]
     
     # Time axis for each beat (750ms)
@@ -196,8 +206,8 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
     use_interpretations = bool(top_features and feature_interpretations)
     if use_interpretations:
         from matplotlib.gridspec import GridSpec
-        fig = plt.figure(figsize=(16, 12))
-        gs = GridSpec(4, 3, height_ratios=[1, 1, 0.8, 1.2], width_ratios=[1, 1, 1], 
+        fig = plt.figure(figsize=(16, 14))
+        gs = GridSpec(5, 3, height_ratios=[1, 1, 0.8, 0.8, 1.2], width_ratios=[1, 1, 1], 
                      hspace=0.35, wspace=0.3)
         
         # Heartbeat plots (top row)
@@ -208,11 +218,14 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
         # Activation plot (second row, spanning all columns)
         ax_act = fig.add_subplot(gs[1, :])
         
-        # Reconstruction comparison (third row, spanning all columns)
+        # Full reconstruction comparison (third row, spanning all columns)
         ax_recon = fig.add_subplot(gs[2, :])
         
+        # Sparse reconstruction comparison (fourth row, spanning all columns)
+        ax_sparse_recon = fig.add_subplot(gs[3, :])
+        
         # Interpretation box (bottom row, spanning all columns)
-        ax_interp = fig.add_subplot(gs[3, :])
+        ax_interp = fig.add_subplot(gs[4, :])
     else:
         fig = plt.figure(figsize=(16, 8))
         gs = GridSpec(3, 3, height_ratios=[1, 1, 0.8], width_ratios=[1, 1, 1], 
@@ -281,12 +294,32 @@ def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np
             ax_recon.text(boundary_ms, max(heartbeats) * 0.9, f'Beat {i+1}', 
                          rotation=90, va='top', ha='right', fontsize=8, alpha=0.7)
         
-        mse_text = f"MSE: {mse:.5f}" if mse is not None else ""
-        ax_recon.set_title(f'Concatenated Heartbeats vs Reconstruction  {mse_text}')
+        mse_text = f"MSE: {full_mse:.5f}" if full_mse is not None else ""
+        ax_recon.set_title(f'Full Reconstruction (All Features)  {mse_text}')
         ax_recon.set_xlabel('Time (ms)')
         ax_recon.set_ylabel('Amplitude')
         ax_recon.legend()
         ax_recon.grid(True, alpha=0.3)
+    
+    # Plot sparse reconstruction (top 5 features only)
+    if sparse_reconstructed_heartbeats is not None:
+        full_time = np.arange(len(heartbeats)) * 1000 / sampling_rate
+        ax_sparse_recon.plot(full_time, heartbeats, 'b-', linewidth=1.0, label='Original Heartbeats', alpha=0.8)
+        ax_sparse_recon.plot(full_time, sparse_reconstructed_heartbeats, 'g--', linewidth=1.5, label='Top-5 Features Reconstruction', alpha=0.9)
+        
+        # Mark beat boundaries
+        for i in range(1, 3):
+            boundary_ms = i * 750
+            ax_sparse_recon.axvline(boundary_ms, color='gray', linestyle=':', alpha=0.5)
+            ax_sparse_recon.text(boundary_ms, max(heartbeats) * 0.9, f'Beat {i+1}', 
+                                rotation=90, va='top', ha='right', fontsize=8, alpha=0.7)
+        
+        sparse_mse_text = f"MSE: {sparse_mse:.5f}" if sparse_mse is not None else ""
+        ax_sparse_recon.set_title(f'Sparse Reconstruction (Top-5 Features Only)  {sparse_mse_text}')
+        ax_sparse_recon.set_xlabel('Time (ms)')
+        ax_sparse_recon.set_ylabel('Amplitude')
+        ax_sparse_recon.legend()
+        ax_sparse_recon.grid(True, alpha=0.3)
     
     # Feature interpretations
     if use_interpretations and ax_interp is not None:
@@ -456,6 +489,17 @@ def main():
         with torch.no_grad():
             recon_heartbeats, latent = model(heartbeats_tensor)
             feature_activations = latent.squeeze(0).cpu().numpy()
+            
+            # Create sparse reconstruction using only top 5 features
+            sparse_latent = torch.zeros_like(latent)
+            top_5_indices = np.argsort(np.abs(feature_activations))[-5:]
+            
+            # Keep only top 5 features
+            for idx in top_5_indices:
+                sparse_latent[0, idx] = latent[0, idx]
+            
+            # Reconstruct from sparse latent representation
+            sparse_recon_heartbeats = model.decode(sparse_latent, use_frozen=False)
 
         # Top features for highlighting
         top_indices = np.argsort(np.abs(feature_activations))[-args.top_k:][::-1]
@@ -477,8 +521,14 @@ def main():
 
         # Calculate reconstruction MSE
         recon_heartbeats_np = recon_heartbeats.squeeze(0).cpu().numpy()
-        mse = float(np.mean((heartbeats - recon_heartbeats_np)**2))
-        print(f"Heartbeat reconstruction MSE: {mse:.6f}")
+        sparse_recon_heartbeats_np = sparse_recon_heartbeats.squeeze(0).cpu().numpy()
+        
+        full_mse = float(np.mean((heartbeats - recon_heartbeats_np)**2))
+        sparse_mse = float(np.mean((heartbeats - sparse_recon_heartbeats_np)**2))
+        
+        print(f"Full reconstruction MSE: {full_mse:.6f}")
+        print(f"Top-5 features reconstruction MSE: {sparse_mse:.6f}")
+        print(f"Top-5 features used: {sorted(top_5_indices)}")
 
         # Plot
         save_filename = f"heartbeat_analysis_{row_meta.name}_{i+1}.png"
@@ -491,7 +541,9 @@ def main():
             sampling_rate=100, 
             save_path=save_filename,
             reconstructed_heartbeats=recon_heartbeats_np,
-            mse=mse
+            sparse_reconstructed_heartbeats=sparse_recon_heartbeats_np,
+            full_mse=full_mse,
+            sparse_mse=sparse_mse
         )
 
         print("-" * 60)
