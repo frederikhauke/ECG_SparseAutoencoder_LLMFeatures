@@ -61,12 +61,18 @@ def load_feature_interpretations(filename: str = 'feature_interpretations.json')
         return {}
 
 
-def extract_timing_features_with_fiducials(ecg_signal: np.ndarray, sampling_rate: int = 100) -> dict:
+def extract_timing_features_with_fiducials(ecg_signal: np.ndarray, ecg_id: int = None, sampling_rate: int = 100) -> dict:
     """Extract timing features with fiducials using unified extractor."""
     try:
-        # Use the unified timing extractor's real-time method
-        extractor = get_timing_extractor(use_cache=False)  # Force real-time extraction
-        features = extractor._extract_timing_features_realtime(ecg_signal, sampling_rate)
+        # Use the same timing extractor as training (with cache enabled)
+        extractor = get_timing_extractor(cache_path="times.csv", use_cache=True)
+        
+        # Use the same method as data loader - pass ECG ID if available
+        features = extractor.get_timing_features(
+            ecg_id=ecg_id,
+            signal_2d=ecg_signal,
+            sampling_rate=sampling_rate
+        )
         
         # Also extract fiducials for visualization using NeuroKit2
         ecg_1d = ecg_signal[:, 1] if ecg_signal.ndim == 2 and ecg_signal.shape[1] > 1 else ecg_signal.flatten()
@@ -118,143 +124,89 @@ def extract_timing_features_with_fiducials(ecg_signal: np.ndarray, sampling_rate
         }
 
 
-def plot_ecg_with_features(ecg_signal: np.ndarray, timing_result: dict, 
+def plot_ecg_with_features(ecg_signal: np.ndarray, timing_result: dict,
                           feature_activations: np.ndarray, top_features: list,
-                          report: str, feature_interpretations: dict = None, 
-                          sampling_rate: int = 100, save_path: str = None):
-    """Plot ECG with timing annotations and feature activations."""
+                          report: str, feature_interpretations: dict = None,
+                          sampling_rate: int = 100, save_path: str = None,
+                          recon_topk: np.ndarray | None = None,
+                          mse_topk: float | None = None):
+    """Plot ECG + activations with an optional large interpretation text box BELOW the plots."""
     time_axis = np.arange(ecg_signal.shape[0]) / sampling_rate
-    
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
-    
-    # Plot ECG with timing annotations
-    ax1.plot(time_axis, ecg_signal, 'b-', linewidth=0.8, label='ECG Lead II')
-    
+
+    use_big_box = bool(top_features and feature_interpretations)
+    if use_big_box:
+        from matplotlib.gridspec import GridSpec
+        fig = plt.figure(figsize=(14, 9))
+        gs = GridSpec(3, 1, height_ratios=[1, 1, 1.4], hspace=0.32)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+        axbox = fig.add_subplot(gs[2])
+    else:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
+        axbox = None
+
+    # ECG plot
+    ax1.plot(time_axis, ecg_signal, 'b-', linewidth=0.8, label='Original ECG (Lead II)')
+    if recon_topk is not None:
+        ax1.plot(time_axis, recon_topk, 'r--', linewidth=1.0, label='Reconstruction (top-k)')
     if timing_result['success']:
         fiducials = timing_result['fiducials']
-        colors = {'p_onset': 'green', 'q_peak': 'red', 'r_peak': 'darkred', 
-                 's_peak': 'red', 't_offset': 'orange'}
-        
-        # Mark fiducial points
+        colors = {'p_onset': 'green', 'q_peak': 'red', 'r_peak': 'darkred', 's_peak': 'red', 't_offset': 'orange'}
         for name, sample_idx in fiducials.items():
             if sample_idx is not None:
-                time_s = sample_idx / sampling_rate
+                t_s = sample_idx / sampling_rate
                 color = colors.get(name, 'purple')
-                ax1.axvline(time_s, color=color, linestyle='--', alpha=0.7)
-                ax1.plot(time_s, ecg_signal[sample_idx], 'o', color=color, 
-                        markersize=6, label=name.upper())
-        
-        # Highlight intervals
-        if fiducials['p_onset'] is not None and fiducials['q_peak'] is not None:
-            start_t = fiducials['p_onset'] / sampling_rate
-            end_t = fiducials['q_peak'] / sampling_rate
-            ax1.axvspan(start_t, end_t, alpha=0.2, color='green', label='PR')
-        
-        if fiducials['q_peak'] is not None and fiducials['s_peak'] is not None:
-            start_t = fiducials['q_peak'] / sampling_rate
-            end_t = fiducials['s_peak'] / sampling_rate
-            ax1.axvspan(start_t, end_t, alpha=0.2, color='red', label='QRS')
-        
-        if fiducials['q_peak'] is not None and fiducials['t_offset'] is not None:
-            start_t = fiducials['q_peak'] / sampling_rate
-            end_t = fiducials['t_offset'] / sampling_rate
-            ax1.axvspan(start_t, end_t, alpha=0.1, color='orange', label='QT')
-    
+                ax1.axvline(t_s, color=color, linestyle='--', alpha=0.7)
+                ax1.plot(t_s, ecg_signal[sample_idx], 'o', color=color, markersize=5, label=name.upper())
+        # Shaded intervals
+        p_on = fiducials.get('p_onset'); q_pk = fiducials.get('q_peak'); s_pk = fiducials.get('s_peak'); t_off = fiducials.get('t_offset')
+        if p_on is not None and q_pk is not None:
+            ax1.axvspan(p_on / sampling_rate, q_pk / sampling_rate, alpha=0.2, color='green', label='PR')
+        if q_pk is not None and s_pk is not None:
+            ax1.axvspan(q_pk / sampling_rate, s_pk / sampling_rate, alpha=0.2, color='red', label='QRS')
+        if q_pk is not None and t_off is not None:
+            ax1.axvspan(q_pk / sampling_rate, t_off / sampling_rate, alpha=0.1, color='orange', label='QT')
     ax1.set_xlabel('Time (s)')
     ax1.set_ylabel('Amplitude (mV)')
-    ax1.set_title('ECG with Timing Intervals')
+    title_extra = f"  (Top-k MSE: {mse_topk:.4f})" if mse_topk is not None else ""
+    ax1.set_title(f'ECG with Timing Intervals{title_extra}')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    # Plot feature activations
+    ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    # Activation bar plot
     ax2.bar(range(len(feature_activations)), feature_activations, alpha=0.7)
     ax2.set_xlabel('Feature Index')
     ax2.set_ylabel('Activation Strength')
     ax2.set_title('Sparse Autoencoder Feature Activations')
     ax2.grid(True, alpha=0.3)
-    
-    # Highlight top features (without legend to avoid overlap)
-    for i, (feat_idx, activation) in enumerate(top_features):
-        bar = ax2.bar(feat_idx, activation, color='red', alpha=0.8)
-        # Add feature index as text annotation on the bar
-        ax2.text(feat_idx, activation + 0.1, f'F{feat_idx}', 
-                ha='center', va='bottom', fontsize=8, fontweight='bold')
-    
-    # Remove legend as we'll show feature info in text box
-    # ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    
-    # Add timing features and report as text
-    features = timing_result['features']
-    text_info = f"Timing Features:\\n"
-    text_info += f"PR: {features[0]:.0f} ms\\n"
-    text_info += f"QRS: {features[1]:.0f} ms\\n"
-    text_info += f"QT: {features[2]:.0f} ms\\n"
-    text_info += f"HR: {features[3]:.0f} bpm\\n\\n"
-    
-    # Add feature key words and summaries
-    if top_features:
-        text_info += f"Top {len(top_features)} Activating Features (Key Word):\\n"
-        for i, (feat_idx, activation) in enumerate(top_features):
-            key_word = "No key word"
-            summary = ""
-            if feature_interpretations and feat_idx in feature_interpretations:
-                interp_data = feature_interpretations[feat_idx]
-                key_word = interp_data.get('key_word', "No key word")
-                summary = interp_data.get('summary', "")
-            text_info += f"F{feat_idx}: {activation:.3f} | {key_word} | {summary}\\n"
-        text_info += "\\n"
-    
-    text_info += f"Report: {report[:50]}..."
+    for feat_idx, activation in top_features:
+        ax2.bar(feat_idx, activation, color='red', alpha=0.85)
+        ax2.text(feat_idx, activation + 0.05, f'F{feat_idx}', ha='center', va='bottom', fontsize=8, fontweight='bold')
 
-    # Display feature info in a wide, wrapped textbox below the bar plot
-    import textwrap
-    feature_lines = text_info.split("\n")
-    wrapped_lines = []
-    for line in feature_lines:
-        wrapped_lines.extend(textwrap.wrap(line, width=90, break_long_words=False, replace_whitespace=False) or [""])
-    wrapped_text = "\n".join(wrapped_lines)
-    # Place textbox just below the x-axis, spanning the width
-    ax2.text(
-        0.01, -0.25, wrapped_text,
-        transform=ax2.transAxes,
-        fontsize=8,
-        fontfamily='monospace',
-        va='top', ha='left',
-        bbox=dict(facecolor='white', edgecolor='gray', boxstyle='round,pad=0.4'),
-        linespacing=1.5,
-        clip_on=False
-    )
-    
-    # Add a large textbox below the plots with summary and key word for top features
-    if top_features and feature_interpretations:
-        interp_texts = []
+    # Big interpretation box below
+    if use_big_box and axbox is not None:
+        axbox.axis('off')
+        interp_lines = []
         for feat_idx, activation in top_features:
             interp = feature_interpretations.get(feat_idx, {})
-            key_word = interp.get('key_word', "No key word")
-            summary = interp.get('summary', "")
-            header = f"Feature {feat_idx} ({key_word}):"
-            interp_texts.append(header)
-            interp_texts.append(summary)
-            interp_texts.append("")
-        interp_texts = interp_texts[:75]
-        big_text = '\n'.join(interp_texts)
-        from matplotlib import gridspec
-        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.2])
-        ax1.set_position(gs[0].get_position(fig))
-        ax2.set_position(gs[1].get_position(fig))
-        axbox = fig.add_subplot(gs[2])
-        axbox.axis('off')
+            key_word = interp.get('key_word', 'N/A')
+            summary = interp.get('summary', '').strip()
+            interp_lines.append(f"Feature {feat_idx} ({key_word})")
+            if summary:
+                interp_lines.append(summary)
+            # Ensure exactly one blank line after each feature block
+            if not interp_lines or interp_lines[-1] != "":
+                interp_lines.append("")
+        # Trim excess
+        interp_text = '\n'.join(interp_lines[:120])
         import textwrap
-        wrapped_big_text = '\n'.join(textwrap.wrap(big_text, width=140, break_long_words=False, replace_whitespace=False))
-        axbox.text(0, 1, wrapped_big_text, va='top', ha='left', fontsize=9, fontfamily='monospace', linespacing=1.3)
-        plt.subplots_adjust(hspace=0.35, bottom=0.08, top=0.96)
+        wrapped = '\n'.join(textwrap.wrap(interp_text, width=150, break_long_words=False))
+        axbox.text(0, 1, wrapped, ha='left', va='top', fontsize=9, fontfamily='monospace', linespacing=1.25)
     else:
-        plt.tight_layout()
-    # Save figure if path provided
+        fig.tight_layout()
+
     if save_path:
-        from pathlib import Path
-        plots_dir = Path("plots")
-        plots_dir.mkdir(exist_ok=True)
+        plots_dir = Path('plots'); plots_dir.mkdir(exist_ok=True)
         plt.savefig(plots_dir / save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to plots/{save_path}")
     plt.show()
@@ -262,7 +214,7 @@ def plot_ecg_with_features(ecg_signal: np.ndarray, timing_result: dict,
 
 def main():
     parser = argparse.ArgumentParser(description="ECG + Timing Features Inference")
-    parser.add_argument("--model_path", default="checkpoints/best_model.pth",
+    parser.add_argument("--model_path", default="checkpoints/best_model_fixed.pth",
                        help="Path to trained model")
     parser.add_argument("--data_path", default="physionet.org/files/ptb-xl/1.0.3/",
                        help="PTB-XL dataset path")
@@ -272,12 +224,52 @@ def main():
                        help="Number of top features to highlight")
     parser.add_argument("--interpretations", default="feature_interpretations.json",
                        help="Path to feature interpretations JSON file")
+    parser.add_argument("--mi_only", action="store_true",
+                       help="Filter to ECGs whose report mentions 'myocardial infarction'")
+    parser.add_argument("--keyword", action="append",
+                       help="Additional keyword to filter reports by (case-insensitive). Can be used multiple times.")
+    parser.add_argument("--max_samples", type=int, default=1000,
+                       help="Limit number of samples loaded from dataset (default: all)")
     
     args = parser.parse_args()
     
+    args.top_k_reconstruction = None  # Use ALL features for reconstruction
     # Load dataset
-    dataset = PTBXLDataset(args.data_path, sampling_rate=100, normalize=False, max_samples=100)
+    dataset = PTBXLDataset(args.data_path, sampling_rate=100, normalize=True, max_samples=args.max_samples)
     print(f"Loaded {len(dataset)} ECG samples")
+
+    # Build filter keyword list
+    filter_keywords = []
+    if args.mi_only:
+        filter_keywords.append("myocardial infarction")
+        # Add common shorthand variants
+        filter_keywords.extend(["stemi", "nstemi", "infarct", "infarction"])
+    if args.keyword:
+        filter_keywords.extend([k.lower() for k in args.keyword])
+
+    # Determine candidate indices based on keywords
+    if filter_keywords:
+        unique_keywords = sorted(set(filter_keywords))
+        print(f"Filtering reports by keywords: {unique_keywords}")
+        candidate_indices = []
+        matched_snippets = []
+        for i in range(len(dataset)):
+            report_raw = str(dataset.metadata.iloc[i].get('report', ''))
+            report_text = report_raw.lower()
+            if any(kw in report_text for kw in unique_keywords):
+                candidate_indices.append(i)
+                snippet = (report_raw[:140] + '...') if len(report_raw) > 140 else report_raw
+                matched_snippets.append(snippet)
+        if not candidate_indices:
+            print("Warning: No ECG reports matched the provided keywords. Using full dataset instead.")
+            candidate_indices = list(range(len(dataset)))
+        else:
+            print(f"Found {len(candidate_indices)} ECGs matching keywords (out of {len(dataset)} total)")
+            print("Showing up to first 5 matched report snippets:")
+            for snip in matched_snippets[:5]:
+                print("  -", snip.replace('\n', ' ') )
+    else:
+        candidate_indices = list(range(len(dataset)))
     
     # Load feature interpretations
     feature_interpretations = load_feature_interpretations(args.interpretations)
@@ -318,7 +310,10 @@ def main():
         timing_features_dim=timing_features_dim,
         hidden_dims=config.get('hidden_dims', [2048, 1024, 512]),
         latent_dim=config.get('latent_dim', 256),
-        sparsity_weight=config.get('sparsity_weight', 0.01)
+        sparsity_weight=config.get('sparsity_weight', 0.01),
+        alpha_aux=config.get('alpha_aux', 0.02),
+        target_sparsity=config.get('target_sparsity', 0.5),
+        use_frozen_decoder_for_aux=config.get('use_frozen_decoder_for_aux', True)
     )
     
     # Load model state
@@ -330,7 +325,8 @@ def main():
     
     # Analyze random samples
     random.seed(42)
-    indices = random.sample(range(len(dataset)), min(args.n_samples, len(dataset)))
+    # Sample from candidate indices
+    indices = random.sample(candidate_indices, min(args.n_samples, len(candidate_indices)))
     
     for i, idx in enumerate(indices):
         sample = dataset[idx]
@@ -343,7 +339,7 @@ def main():
         ecg_signal_flat = sample['signal_flat'].numpy()
         
         # Extract timing features
-        timing_result = extract_timing_features_with_fiducials(ecg_signal_2d, sampling_rate=100)
+        timing_result = extract_timing_features_with_fiducials(ecg_signal_2d, ecg_id=row_meta.name, sampling_rate=100)
         timing_features = timing_result['features']
         
         print(f"Timing features: PR={timing_features[0]:.0f}, QRS={timing_features[1]:.0f}, "
@@ -355,13 +351,18 @@ def main():
         
         # Forward pass through model
         with torch.no_grad():
-            _, latent = model(combined_tensor)
+            full_recon, latent = model(combined_tensor)
             feature_activations = latent.squeeze(0).cpu().numpy()
-        
-        # Find top activating features
+
+        # Top features for highlighting
         top_indices = np.argsort(np.abs(feature_activations))[-args.top_k:][::-1]
         top_features = [(idx, feature_activations[idx]) for idx in top_indices]
-        
+
+        # Separate k for reconstruction  
+        k_recon = args.top_k_reconstruction if args.top_k_reconstruction is not None else len(feature_activations)
+        k_recon = max(1, min(k_recon, feature_activations.shape[0]))
+        recon_indices = np.argsort(np.abs(feature_activations))[-k_recon:][::-1]
+
         print(f"Top {args.top_k} activating features:")
         for feat_idx, activation in top_features:
             interpretation_info = ""
@@ -370,19 +371,44 @@ def main():
                 key_word = interp.get('key_word', '')
                 summary = interp.get('summary', '')
                 interpretation_info = f" | {key_word} | {summary[:60]}{'...' if len(summary) > 60 else ''}"
-            print(f"  Feature {feat_idx}: {activation:.4f}{interpretation_info}")
+            print(f"  Feature {feat_idx}: {activation:.4f}{interpretation_info}\n")
 
         # Get report
         report = str(row_meta.get('report', '')).strip()
         print(f"Clinical report: {report}")
-        
-        # Plot results
+
+        # Reconstruct using all features (no top-k filtering)
+        with torch.no_grad():
+            if args.top_k_reconstruction is None:
+                # Use all features without filtering
+                recon_full_input = model.decode(latent, use_frozen=False)
+                print(f"Using ALL {latent.shape[1]} features for reconstruction")
+            else:
+                # Use top-k features
+                latent_subset = latent.clone()
+                mask = torch.zeros_like(latent_subset)
+                recon_indices_tensor = torch.tensor(list(recon_indices), device=latent_subset.device)
+                mask[0, recon_indices_tensor] = 1.0
+                latent_subset = latent_subset * mask
+                recon_full_input = model.decode(latent_subset, use_frozen=False)
+                print(f"Using top {k_recon} features for reconstruction")
+            recon_np = recon_full_input.squeeze(0).cpu().numpy()
+
+        recon_ecg_flat = recon_np[:ecg_signal_flat.shape[0]]
         ecg_1d = ecg_signal_2d[:, 1] if ecg_signal_2d.shape[1] > 1 else ecg_signal_2d[:, 0]
+        n_time, n_leads = ecg_signal_2d.shape
+        recon_ecg_matrix = recon_ecg_flat.reshape(n_time, n_leads)
+        recon_lead = recon_ecg_matrix[:, 1] if n_leads > 1 else recon_ecg_matrix[:, 0]
+        mse_topk = float(np.mean((ecg_1d - recon_lead)**2))
+        print(f"Reconstruction using top {k_recon} features MSE: {mse_topk:.5f}")
+
+        # Plot
         save_filename = f"ecg_analysis_{row_meta.name}_{i+1}.png"
-        plot_ecg_with_features(ecg_1d, timing_result, feature_activations, 
-                              top_features, report, feature_interpretations, 
-                              sampling_rate=100, save_path=save_filename)
-        
+        plot_ecg_with_features(ecg_1d, timing_result, feature_activations,
+                               top_features, report, feature_interpretations,
+                               sampling_rate=100, save_path=save_filename,
+                               recon_topk=recon_lead, mse_topk=mse_topk)
+
         print("-" * 60)
 
 

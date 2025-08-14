@@ -14,7 +14,9 @@ from tools.timing_extractor import get_timing_extractor
 
 
 class PTBXLDataset(Dataset):
-    """PTB-XL ECG Dataset loader."""
+    """PTB-XL ECG Dataset loader.
+
+    """
     
     def __init__(self, data_path: str, sampling_rate: int = 100, 
                  normalize: bool = True, max_samples: int = None):
@@ -24,13 +26,16 @@ class PTBXLDataset(Dataset):
         Args:
             data_path: Path to PTB-XL dataset
             sampling_rate: Sampling rate (100 or 500 Hz)
-            normalize: Whether to normalize the ECG signals
+            normalize: Whether to apply fixed linear rescaling to [0,1]
             max_samples: Maximum number of samples to load (for testing)
+            scale_min: Assumed lower bound of ECG amplitude (mV)
+            scale_max: Assumed upper bound of ECG amplitude (mV)
         """
         self.data_path = Path(data_path)
         self.sampling_rate = sampling_rate
         self.normalize = normalize
-        
+        self.scale_min = -1.0
+        self.scale_max = 2.0        
         # Initialize timing extractor
         self.timing_extractor = get_timing_extractor(cache_path="times.csv", use_cache=True)
         
@@ -84,11 +89,17 @@ class PTBXLDataset(Dataset):
         print(f"Signal shape: {self.signals.shape}")
         
     def _normalize_signals(self):
-        """Normalize ECG signals to zero mean and unit variance."""
-        # Normalize per signal across all leads and time points
+        """Apply fixed linear rescaling from [scale_min, scale_max] to [0,1]."""
+        rng = (self.scale_max - self.scale_min)
+        if rng <= 0:
+            raise ValueError("scale_max must be greater than scale_min")
         for i in range(len(self.signals)):
             signal = self.signals[i]
-            self.signals[i] = (signal - signal.mean()) / (signal.std() + 1e-8)
+            # Linear mapping
+            scaled = (signal - self.scale_min) / rng
+            # Clip to [0,1] to avoid extreme outliers
+            scaled = np.clip(scaled, 0.0, 1.0)
+            self.signals[i] = scaled
     
     def __len__(self):
         return len(self.signals)

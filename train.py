@@ -32,7 +32,7 @@ class ECGSparseAutoencoderTrainer:
         self.train_metrics = []
         self.val_metrics = []
         
-    def train_epoch(self, train_loader, optimizer, epoch: int) -> Dict[str, float]:
+    def train_epoch(self, train_loader, optimizer, epoch: int, k_frozen_update: int | None = None) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
         
@@ -41,10 +41,10 @@ class ECGSparseAutoencoderTrainer:
         total_l1_loss = 0
         total_kl_loss = 0
         num_batches = 0
-        
+
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
-        
-        for batch in pbar:
+
+        for step, batch in enumerate(pbar, start=1):
             x = batch['combined_features'].to(self.device)  # Use combined ECG + timing features
             
             optimizer.zero_grad()
@@ -55,6 +55,9 @@ class ECGSparseAutoencoderTrainer:
             total_loss_batch.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optimizer.step()
+            if k_frozen_update and step % k_frozen_update == 0:
+                # Refresh frozen decoder snapshot
+                self.model.refresh_frozen_decoder()
             total_loss += total_loss_batch.item()
             total_recon_loss += losses['L_recon'].item()
             total_l1_loss += losses['L_sparsity'].item()
@@ -101,7 +104,8 @@ class ECGSparseAutoencoderTrainer:
         }
     
     def train(self, train_loader, val_loader, num_epochs: int, 
-              learning_rate: float = 0.001, save_dir: str = 'checkpoints'):
+              learning_rate: float = 0.001, save_dir: str = 'checkpoints',
+              k_frozen_update: int | None = 200):
         """
         Train the sparse autoencoder.
         
@@ -124,7 +128,7 @@ class ECGSparseAutoencoderTrainer:
         
         best_val_loss = float('inf')
         patience_counter = 0
-        max_patience = 15
+        max_patience = 20
         
         print(f"Starting training for {num_epochs} epochs...")
         print(f"Device: {self.device}")
@@ -134,7 +138,7 @@ class ECGSparseAutoencoderTrainer:
             start_time = time.time()
             
             # Train
-            train_metrics = self.train_epoch(train_loader, optimizer, epoch)
+            train_metrics = self.train_epoch(train_loader, optimizer, epoch, k_frozen_update=k_frozen_update)
             
             # Validate
             val_metrics = self.validate(val_loader)
@@ -189,6 +193,9 @@ class ECGSparseAutoencoderTrainer:
                         'input_dim': int(self.model.input_dim),
                         'latent_dim': int(self.model.latent_dim),
                         'sparsity_weight': float(self.model.sparsity_weight),
+                        'alpha_aux': float(self.model.alpha_aux),
+                        'target_sparsity': float(self.model.target_sparsity),
+                        'use_frozen_decoder_for_aux': bool(self.model.use_frozen_decoder_for_aux),
                         'hidden_dims': [2048, 1024, 512],  # Default hidden dims
                         'dropout_rate': 0.2
                     }
@@ -287,28 +294,30 @@ class ECGSparseAutoencoderTrainer:
         plt.show()
 
 
+def load_config(config_path: str = 'config.json') -> dict:
+    """Load configuration from JSON file."""
+    import json
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    # Flatten nested config for easier access
+    flat_config = {}
+    for section, values in config.items():
+        if isinstance(values, dict):
+            flat_config.update(values)
+        else:
+            flat_config[section] = values
+    
+    return flat_config
+
+
 def main():
     """Main training function."""
-    # Configuration
-    config = {
-        'data_path': 'physionet.org/files/ptb-xl/1.0.3/',
-        'batch_size': 32,
-        'num_epochs': 100,
-        'learning_rate': 0.001,
-        'sampling_rate': 100,
-        'test_fold': 10,
-        
-        # Model configuration
-        'hidden_dims': [2048, 1024, 512],
-        'latent_dim': 256,
-        'sparsity_weight': 0.01,
-        'kl_weight': 0.0,
-        'target_sparsity': 0.05,
-        'dropout_rate': 0.2,
-        
-        # For testing, limit samples
-        'max_samples': None  # Remove or set to None for full dataset
-    }
+    # Load configuration from config.json
+    config = load_config('config.json')
+    print("Loaded configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
     
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -331,13 +340,16 @@ def main():
     print(f"ECG input dim: {ecg_input_dim}, Timing features dim: {timing_features_dim}")
     print(f"Total input dimension: {total_input_dim}")
     
-    # Create model
+    # Create model with all config parameters
     model = GatedSparseAutoencoder(
         ecg_input_dim=ecg_input_dim,
         timing_features_dim=timing_features_dim,
         hidden_dims=config['hidden_dims'],
         latent_dim=config['latent_dim'],
-        sparsity_weight=config['sparsity_weight']
+        sparsity_weight=config['sparsity_weight'],
+        alpha_aux=config.get('alpha_aux', 0.02),
+        target_sparsity=config['target_sparsity'],
+        use_frozen_decoder_for_aux=config.get('use_frozen_decoder_for_aux', True)
     )
     
     print(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -350,7 +362,8 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         num_epochs=config['num_epochs'],
-        learning_rate=config['learning_rate']
+        learning_rate=config['learning_rate'],
+        k_frozen_update=config.get('k_frozen_update')
     )
     
     # Plot training curves

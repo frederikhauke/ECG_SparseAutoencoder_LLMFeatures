@@ -11,10 +11,13 @@ def col_norms(matrix: Tensor, eps=1e-8) -> Tensor:
     return torch.sqrt((matrix ** 2).sum(dim=0) + eps)
 
 class GatedSparseAutoencoder(nn.Module):
+    """Gated Sparse Autoencoder for ECG + timing features.
+
+    Change: auxiliary loss weight reduced (alpha_aux default 0.02) and made configurable.
     """
-    Gated Sparse Autoencoder for ECG + timing features, following the provided template.
-    """
-    def __init__(self, ecg_input_dim: int, timing_features_dim: int, hidden_dims: list, latent_dim: int, sparsity_weight: float = 0.01, use_frozen_decoder_for_aux: bool = True):
+    def __init__(self, ecg_input_dim: int, timing_features_dim: int, hidden_dims: list, latent_dim: int,
+                 sparsity_weight: float = 0.01, use_frozen_decoder_for_aux: bool = True,
+                 alpha_aux: float = 0.1, target_sparsity: float = 0.5):
         super().__init__()
         self.ecg_input_dim = ecg_input_dim
         self.timing_features_dim = timing_features_dim
@@ -23,13 +26,19 @@ class GatedSparseAutoencoder(nn.Module):
         self.hidden_dims = hidden_dims
         self.sparsity_weight = sparsity_weight  # For config and trainer access
         self.use_frozen_decoder_for_aux = use_frozen_decoder_for_aux
+        self.alpha_aux = alpha_aux  # default reduced auxiliary loss weight
+        self.target_sparsity = target_sparsity
 
-        # Encoder: stack hidden layers, then use gating/mag/decoder as in template
+        # Encoder
         encoder_layers = []
         prev_dim = self.input_dim
         for hidden_dim in hidden_dims:
+            linear_layer = nn.Linear(prev_dim, hidden_dim)
+            # Proper Xavier/Glorot initialization to prevent exploding activations
+            nn.init.xavier_uniform_(linear_layer.weight, gain=nn.init.calculate_gain('relu'))
+            nn.init.zeros_(linear_layer.bias)
             encoder_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
+                linear_layer,
                 nn.ReLU()
             ])
             prev_dim = hidden_dim
@@ -38,9 +47,13 @@ class GatedSparseAutoencoder(nn.Module):
 
         # Gate weights (W_gate) and bias
         self.W_gate = nn.Parameter(torch.randn(latent_dim, encoder_out_dim) * (1.0 / (encoder_out_dim ** 0.5)))
-        self.b_gate = nn.Parameter(torch.zeros(latent_dim))
+        # Initialize gate bias to achieve target sparsity
+        # Use positive bias to encourage some activation initially
+        gate_bias_init = 2.0  # Reasonable positive bias
+        
+        self.b_gate = nn.Parameter(torch.full((latent_dim,), gate_bias_init))
 
-        # Magnitude weights (W_mag) share direction with W_gate, scaled by exp(r_mag)
+        # Magnitude weights (W_mag)
         self.r_mag = nn.Parameter(torch.zeros(latent_dim))
         self.b_mag = nn.Parameter(torch.zeros(latent_dim))
 
@@ -57,9 +70,17 @@ class GatedSparseAutoencoder(nn.Module):
         return self.W_gate * scales
 
     def encode(self, x: Tensor):
-        x_proj = self.encoder(x)
+        # The paper formula uses (x - b_dec), but we need to be careful about dimensions
+        # x_proj comes from encoder (encoder_out_dim), b_dec is input_dim
+        # The paper likely means we should center the original input x, not encoder output
+        x_centered = x - self.b_dec.unsqueeze(0) if x.shape[-1] == self.b_dec.shape[0] else x
+        x_proj = self.encoder(x_centered)
+        
         pre_gate = F.linear(x_proj, self.W_gate, self.b_gate)
+        
+        # Hard binary gating
         gate_mask = (pre_gate > 0).float()
+            
         W_mag = self.compute_W_mag()
         mag = F.linear(x_proj, W_mag, self.b_mag)
         mag = F.relu(mag)
@@ -80,31 +101,42 @@ class GatedSparseAutoencoder(nn.Module):
         x_hat = self.decode(h, use_frozen=False)
         return x_hat, h
 
-    def loss(self, x: Tensor, lambda_sparsity: float, sae_rad_style: bool = False):
+    def loss(self, x: Tensor, lambda_sparsity: float, sae_rad_style: bool = False, alpha_aux: float = None, 
+             target_sparsity: float = None):
+        if alpha_aux is None:
+            alpha_aux = self.alpha_aux
         pre_gate, RA, mag, h = self.encode(x)
         x_hat = self.decode(h, use_frozen=False)
-        # Reconstruction MSE
         L_recon = F.mse_loss(x_hat, x, reduction="mean")
-        # Sparsity term
-        if sae_rad_style:
-            dec_col_norms = col_norms(self.W_dec)
-            weighted = RA * dec_col_norms.unsqueeze(0)
-            L_sparsity = lambda_sparsity * weighted.mean()
+        
+        if target_sparsity is not None:
+            # Use target sparsity loss instead of L1 penalty
+            current_sparsity = (h > 1e-6).float().mean()  # Fraction of active features
+            L_sparsity = lambda_sparsity * torch.abs(current_sparsity - target_sparsity)
         else:
-            L_sparsity = lambda_sparsity * RA.abs().mean()
-        # Auxiliary loss
+            # Original L1 sparsity loss
+            if sae_rad_style:
+                dec_col_norms = col_norms(self.W_dec)
+                weighted = RA * dec_col_norms.unsqueeze(0)
+                L_sparsity = lambda_sparsity * weighted.mean()
+            else:
+                L_sparsity = lambda_sparsity * RA.abs().mean()
+        
         if self.use_frozen_decoder_for_aux and (not sae_rad_style):
             x_hat_aux = self.decode(RA, use_frozen=True)
         else:
             x_hat_aux = self.decode(RA, use_frozen=False)
         L_aux = F.mse_loss(x_hat_aux, x, reduction="mean")
-        total = L_recon + L_sparsity + L_aux
-        return {
-            "loss": total,
-            "L_recon": L_recon,
-            "L_sparsity": L_sparsity,
-            "L_aux": L_aux
-        }
+        total = L_recon + L_sparsity + alpha_aux * L_aux
+        return {"loss": total, "L_recon": L_recon, "L_sparsity": L_sparsity, "L_aux": L_aux, "alpha_aux": alpha_aux}
+
+    @torch.no_grad()
+    def refresh_frozen_decoder(self):
+        """Refresh the frozen decoder weights from the current decoder every scheduled step."""
+        if self.use_frozen_decoder_for_aux:
+            if hasattr(self, "_W_dec_frozen") and hasattr(self, "_b_dec_frozen"):
+                self._W_dec_frozen.copy_(self.W_dec.detach())
+                self._b_dec_frozen.copy_(self.b_dec.detach())
 
     def extract_timing_features(self, ecg_signal: np.ndarray, sampling_rate: int = 100, ecg_id: Optional[int] = None) -> np.ndarray:
         return extract_timing_features(
