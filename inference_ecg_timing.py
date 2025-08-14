@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-ECG + Timing Features Inference Script
+Simplified ECG Heartbeats Inference Script
 
 This script:
 1. Loads a random ECG from the dataset
-2. Extracts timing features using NeuroKit2
-3. Passes combined input through trained sparse autoencoder
+2. Extracts 3 representative heartbeats from lead II (750ms each, centered 100ms after QRS)
+3. Passes heartbeats through trained sparse autoencoder
 4. Shows which features activate most with clinical interpretations
-5. Plots ECG with timing annotations and feature activations
+5. Plots the 3 heartbeats and their reconstructions alongside feature activations
 
 Usage: python inference_ecg_timing.py [--model_path MODEL.pth]
 """
@@ -26,8 +26,70 @@ except ImportError:
     raise SystemExit("Install NeuroKit2: pip install neurokit2")
 
 from data_loader import PTBXLDataset
+from preprocess_data import extract_representative_heartbeats
 from sparse_autoencoder import GatedSparseAutoencoder
-from tools.timing_extractor import get_timing_extractor
+from simple_autoencoder import SimpleAutoencoder
+
+
+def detect_model_type(checkpoint):
+    """
+    Detect whether the checkpoint is from a GatedSparseAutoencoder or SimpleAutoencoder.
+    
+    Args:
+        checkpoint: The loaded checkpoint dictionary
+        
+    Returns:
+        str: 'sparse' for GatedSparseAutoencoder, 'simple' for SimpleAutoencoder
+    """
+    state_dict = checkpoint.get('model_state_dict', {})
+    
+    # Check for GatedSparseAutoencoder specific parameters
+    sparse_keys = ['W_gate', 'b_gate', 'r_mag', 'b_mag', 'W_dec', 'b_dec']
+    if any(key in state_dict for key in sparse_keys):
+        return 'sparse'
+    
+    # Check for SimpleAutoencoder specific parameters
+    simple_keys = ['encoder.0.weight', 'decoder.0.weight']
+    if any(key in state_dict for key in simple_keys):
+        return 'simple'
+    
+    # Default fallback (could also raise an error)
+    print("Warning: Could not detect model type, defaulting to sparse")
+    return 'sparse'
+
+
+def create_model_from_checkpoint(checkpoint, heartbeat_input_dim, config):
+    """
+    Create the appropriate model based on the checkpoint type.
+    
+    Args:
+        checkpoint: The loaded checkpoint
+        heartbeat_input_dim: Input dimension for heartbeats
+        config: Configuration dictionary
+        
+    Returns:
+        The created model instance
+    """
+    model_type = detect_model_type(checkpoint)
+    
+    model_args = {
+        'heartbeat_input_dim': heartbeat_input_dim,
+        'hidden_dims': config.get('hidden_dims', [512, 256]),
+        'latent_dim': config.get('latent_dim', 128),
+        'sparsity_weight': config.get('sparsity_weight', 0.01),
+        'alpha_aux': config.get('alpha_aux', 0.02),
+        'target_sparsity': config.get('target_sparsity', 0.1),
+        'use_frozen_decoder_for_aux': config.get('use_frozen_decoder_for_aux', True)
+    }
+    
+    if model_type == 'simple':
+        print("Loading SimpleAutoencoder model...")
+        model = SimpleAutoencoder(**model_args)
+    else:
+        print("Loading GatedSparseAutoencoder model...")
+        model = GatedSparseAutoencoder(**model_args)
+    
+    return model
 
 
 def load_feature_interpretations(filename: str = 'feature_interpretations.json') -> dict:
@@ -61,163 +123,215 @@ def load_feature_interpretations(filename: str = 'feature_interpretations.json')
         return {}
 
 
-def extract_timing_features_with_fiducials(ecg_signal: np.ndarray, ecg_id: int = None, sampling_rate: int = 100) -> dict:
-    """Extract timing features with fiducials using unified extractor."""
+def extract_heartbeats_with_timing(ecg_signal: np.ndarray, sampling_rate: int = 100) -> dict:
+    """Extract 3 representative heartbeats and basic timing info for visualization."""
     try:
-        # Use the same timing extractor as training (with cache enabled)
-        extractor = get_timing_extractor(cache_path="times.csv", use_cache=True)
-        
-        # Use the same method as data loader - pass ECG ID if available
-        features = extractor.get_timing_features(
-            ecg_id=ecg_id,
-            signal_2d=ecg_signal,
-            sampling_rate=sampling_rate
+        # Extract heartbeats using the same function as the data loader
+        heartbeats = extract_representative_heartbeats(
+            ecg_signal,
+            sampling_rate=sampling_rate,
+            lead_idx=1,  # Lead II
+            num_beats=3,
+            beat_duration_ms=750,
+            qrs_offset_ms=100
         )
         
-        # Also extract fiducials for visualization using NeuroKit2
+        # Also extract R peaks for basic visualization
         ecg_1d = ecg_signal[:, 1] if ecg_signal.ndim == 2 and ecg_signal.shape[1] > 1 else ecg_signal.flatten()
-        
         signals, info = nk.ecg_process(ecg_1d, sampling_rate=sampling_rate)
         r_peaks = info["ECG_R_Peaks"]
         
-        fiducials = {}
-        if len(r_peaks) >= 2:
-            # Delineate waves for fiducial points
-            _, waves = nk.ecg_delineate(signals["ECG_Clean"], r_peaks, sampling_rate=sampling_rate)
-            
-            def get_points(key):
-                pts = waves.get(key, [])
-                return np.array(pts)[~np.isnan(pts)].astype(int) if pts is not None else np.array([])
-            
-            p_onsets = get_points("ECG_P_Onsets")
-            q_peaks = get_points("ECG_Q_Peaks") 
-            s_peaks = get_points("ECG_S_Peaks")
-            t_offsets = get_points("ECG_T_Offsets")
-            
-            # Get fiducials for first beat
-            r_peak = r_peaks[0]
-            p_onset = p_onsets[p_onsets < r_peak][-1] if len(p_onsets[p_onsets < r_peak]) > 0 else None
-            q_peak = q_peaks[np.abs(q_peaks - r_peak) <= 25][0] if len(q_peaks[np.abs(q_peaks - r_peak) <= 25]) > 0 else r_peak
-            s_peak = s_peaks[np.abs(s_peaks - r_peak) <= 50][0] if len(s_peaks[np.abs(s_peaks - r_peak) <= 50]) > 0 else r_peak
-            t_offset = t_offsets[t_offsets > r_peak][0] if len(t_offsets[t_offsets > r_peak]) > 0 else None
-            
-            fiducials = {
-                'p_onset': p_onset,
-                'q_peak': q_peak,
-                'r_peak': r_peak,
-                's_peak': s_peak,
-                't_offset': t_offset
-            }
+        # Calculate beat duration in samples
+        beat_samples = int(750 * sampling_rate / 1000)  # 750ms
         
         return {
-            'features': features,
-            'fiducials': fiducials,
+            'heartbeats': heartbeats,
+            'beat_samples': beat_samples,
+            'r_peaks': r_peaks[:3] if len(r_peaks) >= 3 else r_peaks,
+            'ecg_clean': ecg_1d,
             'success': True
         }
         
     except Exception as e:
-        print(f"Timing extraction failed: {e}")
+        print(f"Heartbeat extraction failed: {e}")
+        # Return zeros as fallback
+        beat_samples = int(750 * sampling_rate / 1000)
         return {
-            'features': np.array([150.0, 80.0, 400.0, 70.0]),
-            'fiducials': {},
+            'heartbeats': np.zeros(3 * beat_samples),
+            'beat_samples': beat_samples,
+            'r_peaks': [],
+            'ecg_clean': ecg_signal[:, 1] if ecg_signal.ndim == 2 else ecg_signal.flatten(),
             'success': False
         }
 
 
-def plot_ecg_with_features(ecg_signal: np.ndarray, timing_result: dict,
-                          feature_activations: np.ndarray, top_features: list,
-                          report: str, feature_interpretations: dict = None,
-                          sampling_rate: int = 100, save_path: str = None,
-                          recon_topk: np.ndarray | None = None,
-                          mse_topk: float | None = None):
-    """Plot ECG + activations with an optional large interpretation text box BELOW the plots."""
-    time_axis = np.arange(ecg_signal.shape[0]) / sampling_rate
-
-    use_big_box = bool(top_features and feature_interpretations)
-    if use_big_box:
+def plot_heartbeats_with_features(heartbeats_data: dict, feature_activations: np.ndarray, 
+                                 top_features: list, report: str, 
+                                 feature_interpretations: dict = None,
+                                 sampling_rate: int = 100, save_path: str = None,
+                                 reconstructed_heartbeats: np.ndarray = None,
+                                 mse: float = None):
+    """Plot 3 heartbeats and their reconstructions with feature activations."""
+    
+    heartbeats = heartbeats_data['heartbeats']
+    beat_samples = heartbeats_data['beat_samples']
+    
+    # Split heartbeats into individual beats
+    beat1 = heartbeats[:beat_samples]
+    beat2 = heartbeats[beat_samples:2*beat_samples]
+    beat3 = heartbeats[2*beat_samples:3*beat_samples]
+    
+    # Split reconstructed heartbeats if provided
+    recon_beats = []
+    if reconstructed_heartbeats is not None:
+        recon_beats = [
+            reconstructed_heartbeats[:beat_samples],
+            reconstructed_heartbeats[beat_samples:2*beat_samples],
+            reconstructed_heartbeats[2*beat_samples:3*beat_samples]
+        ]
+    
+    # Time axis for each beat (750ms)
+    beat_time = np.arange(beat_samples) * 1000 / sampling_rate  # in milliseconds
+    
+    use_interpretations = bool(top_features and feature_interpretations)
+    if use_interpretations:
         from matplotlib.gridspec import GridSpec
-        fig = plt.figure(figsize=(14, 9))
-        gs = GridSpec(3, 1, height_ratios=[1, 1, 1.4], hspace=0.32)
-        ax1 = fig.add_subplot(gs[0])
-        ax2 = fig.add_subplot(gs[1])
-        axbox = fig.add_subplot(gs[2])
+        fig = plt.figure(figsize=(16, 12))
+        gs = GridSpec(4, 3, height_ratios=[1, 1, 0.8, 1.2], width_ratios=[1, 1, 1], 
+                     hspace=0.35, wspace=0.3)
+        
+        # Heartbeat plots (top row)
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax3 = fig.add_subplot(gs[0, 2])
+        
+        # Activation plot (second row, spanning all columns)
+        ax_act = fig.add_subplot(gs[1, :])
+        
+        # Reconstruction comparison (third row, spanning all columns)
+        ax_recon = fig.add_subplot(gs[2, :])
+        
+        # Interpretation box (bottom row, spanning all columns)
+        ax_interp = fig.add_subplot(gs[3, :])
     else:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
-        axbox = None
-
-    # ECG plot
-    ax1.plot(time_axis, ecg_signal, 'b-', linewidth=0.8, label='Original ECG (Lead II)')
-    if recon_topk is not None:
-        ax1.plot(time_axis, recon_topk, 'r--', linewidth=1.0, label='Reconstruction (top-k)')
-    if timing_result['success']:
-        fiducials = timing_result['fiducials']
-        colors = {'p_onset': 'green', 'q_peak': 'red', 'r_peak': 'darkred', 's_peak': 'red', 't_offset': 'orange'}
-        for name, sample_idx in fiducials.items():
-            if sample_idx is not None:
-                t_s = sample_idx / sampling_rate
-                color = colors.get(name, 'purple')
-                ax1.axvline(t_s, color=color, linestyle='--', alpha=0.7)
-                ax1.plot(t_s, ecg_signal[sample_idx], 'o', color=color, markersize=5, label=name.upper())
-        # Shaded intervals
-        p_on = fiducials.get('p_onset'); q_pk = fiducials.get('q_peak'); s_pk = fiducials.get('s_peak'); t_off = fiducials.get('t_offset')
-        if p_on is not None and q_pk is not None:
-            ax1.axvspan(p_on / sampling_rate, q_pk / sampling_rate, alpha=0.2, color='green', label='PR')
-        if q_pk is not None and s_pk is not None:
-            ax1.axvspan(q_pk / sampling_rate, s_pk / sampling_rate, alpha=0.2, color='red', label='QRS')
-        if q_pk is not None and t_off is not None:
-            ax1.axvspan(q_pk / sampling_rate, t_off / sampling_rate, alpha=0.1, color='orange', label='QT')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Amplitude (mV)')
-    title_extra = f"  (Top-k MSE: {mse_topk:.4f})" if mse_topk is not None else ""
-    ax1.set_title(f'ECG with Timing Intervals{title_extra}')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
-
-    # Activation bar plot
-    ax2.bar(range(len(feature_activations)), feature_activations, alpha=0.7)
-    ax2.set_xlabel('Feature Index')
-    ax2.set_ylabel('Activation Strength')
-    ax2.set_title('Sparse Autoencoder Feature Activations')
-    ax2.grid(True, alpha=0.3)
+        fig = plt.figure(figsize=(16, 8))
+        gs = GridSpec(3, 3, height_ratios=[1, 1, 0.8], width_ratios=[1, 1, 1], 
+                     hspace=0.3, wspace=0.3)
+        
+        # Heartbeat plots
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax3 = fig.add_subplot(gs[0, 2])
+        
+        # Activation plot
+        ax_act = fig.add_subplot(gs[1, :])
+        
+        # Reconstruction comparison
+        ax_recon = fig.add_subplot(gs[2, :])
+        
+        ax_interp = None
+    
+    # Plot individual heartbeats
+    beats = [beat1, beat2, beat3]
+    axes = [ax1, ax2, ax3]
+    
+    for i, (beat, ax) in enumerate(zip(beats, axes)):
+        ax.plot(beat_time, beat, 'b-', linewidth=1.2, label='Original')
+        if recon_beats:
+            ax.plot(beat_time, recon_beats[i], 'r--', linewidth=1.2, label='Reconstruction')
+        
+        # Mark QRS center (100ms offset point)
+        qrs_center_ms = 100 + (750 / 2)  # QRS offset + half beat duration
+        if qrs_center_ms <= beat_time[-1]:
+            qrs_idx = int(qrs_center_ms * sampling_rate / 1000)
+            if qrs_idx < len(beat):
+                ax.axvline(qrs_center_ms, color='red', linestyle=':', alpha=0.7, label='QRS+100ms')
+                ax.plot(qrs_center_ms, beat[qrs_idx], 'ro', markersize=4)
+        
+        ax.set_title(f'Heartbeat {i+1}')
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Amplitude')
+        ax.grid(True, alpha=0.3)
+        if i == 0:  # Only show legend on first plot
+            ax.legend(fontsize=8)
+    
+    # Feature activation plot
+    ax_act.bar(range(len(feature_activations)), feature_activations, alpha=0.7, color='lightblue')
+    ax_act.set_xlabel('Feature Index')
+    ax_act.set_ylabel('Activation Strength')
+    ax_act.set_title('Sparse Autoencoder Feature Activations')
+    ax_act.grid(True, alpha=0.3)
+    
+    # Highlight top features
     for feat_idx, activation in top_features:
-        ax2.bar(feat_idx, activation, color='red', alpha=0.85)
-        ax2.text(feat_idx, activation + 0.05, f'F{feat_idx}', ha='center', va='bottom', fontsize=8, fontweight='bold')
-
-    # Big interpretation box below
-    if use_big_box and axbox is not None:
-        axbox.axis('off')
+        ax_act.bar(feat_idx, activation, color='red', alpha=0.85)
+        ax_act.text(feat_idx, activation + max(feature_activations) * 0.05, 
+                   f'F{feat_idx}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+    
+    # Reconstruction comparison plot
+    if reconstructed_heartbeats is not None:
+        full_time = np.arange(len(heartbeats)) * 1000 / sampling_rate
+        ax_recon.plot(full_time, heartbeats, 'b-', linewidth=1.0, label='Original Heartbeats', alpha=0.8)
+        ax_recon.plot(full_time, reconstructed_heartbeats, 'r--', linewidth=1.0, label='Reconstructed', alpha=0.8)
+        
+        # Mark beat boundaries
+        for i in range(1, 3):
+            boundary_ms = i * 750
+            ax_recon.axvline(boundary_ms, color='gray', linestyle=':', alpha=0.5)
+            ax_recon.text(boundary_ms, max(heartbeats) * 0.9, f'Beat {i+1}', 
+                         rotation=90, va='top', ha='right', fontsize=8, alpha=0.7)
+        
+        mse_text = f"MSE: {mse:.5f}" if mse is not None else ""
+        ax_recon.set_title(f'Concatenated Heartbeats vs Reconstruction  {mse_text}')
+        ax_recon.set_xlabel('Time (ms)')
+        ax_recon.set_ylabel('Amplitude')
+        ax_recon.legend()
+        ax_recon.grid(True, alpha=0.3)
+    
+    # Feature interpretations
+    if use_interpretations and ax_interp is not None:
+        ax_interp.axis('off')
         interp_lines = []
+        
         for feat_idx, activation in top_features:
             interp = feature_interpretations.get(feat_idx, {})
             key_word = interp.get('key_word', 'N/A')
             summary = interp.get('summary', '').strip()
-            interp_lines.append(f"Feature {feat_idx} ({key_word})")
+            
+            interp_lines.append(f"Feature {feat_idx} (activation: {activation:.4f}) - {key_word}")
             if summary:
-                interp_lines.append(summary)
-            # Ensure exactly one blank line after each feature block
-            if not interp_lines or interp_lines[-1] != "":
-                interp_lines.append("")
-        # Trim excess
-        interp_text = '\n'.join(interp_lines[:120])
+                interp_lines.append(f"  {summary}")
+            interp_lines.append("")  # Blank line between features
+        
+        # Add clinical report
+        interp_lines.append(f"Clinical Report:")
+        interp_lines.append(f"  {report}")
+        
+        interp_text = '\n'.join(interp_lines)
         import textwrap
-        wrapped = '\n'.join(textwrap.wrap(interp_text, width=150, break_long_words=False))
-        axbox.text(0, 1, wrapped, ha='left', va='top', fontsize=9, fontfamily='monospace', linespacing=1.25)
-    else:
-        fig.tight_layout()
-
+        wrapped = '\n'.join(textwrap.wrap(interp_text, width=120, break_long_words=False))
+        ax_interp.text(0.05, 0.95, wrapped, ha='left', va='top', fontsize=9, 
+                      fontfamily='monospace', transform=ax_interp.transAxes)
+    
+    plt.tight_layout()
+    
     if save_path:
-        plots_dir = Path('plots'); plots_dir.mkdir(exist_ok=True)
+        plots_dir = Path('plots')
+        plots_dir.mkdir(exist_ok=True)
         plt.savefig(plots_dir / save_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to plots/{save_path}")
+    
     plt.show()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ECG + Timing Features Inference")
-    parser.add_argument("--model_path", default="checkpoints/best_model_fixed.pth",
+    parser = argparse.ArgumentParser(description="Simplified ECG Heartbeats Inference")
+    parser.add_argument("--model_path", default="checkpoints/best_model.pth",
                        help="Path to trained model")
     parser.add_argument("--data_path", default="physionet.org/files/ptb-xl/1.0.3/",
                        help="PTB-XL dataset path")
+    parser.add_argument("--preprocessed_path", default="preprocessed_data",
+                       help="Path to preprocessed data directory")
     parser.add_argument("--n_samples", type=int, default=3,
                        help="Number of random samples to analyze")
     parser.add_argument("--top_k", type=int, default=5,
@@ -234,8 +348,8 @@ def main():
     args = parser.parse_args()
     
     args.top_k_reconstruction = None  # Use ALL features for reconstruction
-    # Load dataset
-    dataset = PTBXLDataset(args.data_path, sampling_rate=100, normalize=True, max_samples=args.max_samples)
+    # Load dataset from preprocessed data
+    dataset = PTBXLDataset(args.preprocessed_path, original_data_path=args.data_path, max_samples=args.max_samples)
     print(f"Loaded {len(dataset)} ECG samples")
 
     # Build filter keyword list
@@ -296,25 +410,11 @@ def main():
     # Extract model configuration
     config = checkpoint.get('model_config', {})
     
-    # Calculate ECG and timing dimensions from total input dimension
-    total_input_dim = config.get('input_dim', 12004)  # 12000 ECG + 4 timing features
-    ecg_input_dim = total_input_dim - 4
-    timing_features_dim = 4
+    # Get heartbeat input dimension (3 beats * 750ms * sampling_rate / 1000)
+    heartbeat_input_dim = config.get('heartbeat_input_dim', 225)  # Default for 100Hz
     
-    # Import here to avoid circular import
-    from sparse_autoencoder import GatedSparseAutoencoder
-    
-    # Create model with loaded configuration
-    model = GatedSparseAutoencoder(
-        ecg_input_dim=ecg_input_dim,
-        timing_features_dim=timing_features_dim,
-        hidden_dims=config.get('hidden_dims', [2048, 1024, 512]),
-        latent_dim=config.get('latent_dim', 256),
-        sparsity_weight=config.get('sparsity_weight', 0.01),
-        alpha_aux=config.get('alpha_aux', 0.02),
-        target_sparsity=config.get('target_sparsity', 0.5),
-        use_frozen_decoder_for_aux=config.get('use_frozen_decoder_for_aux', True)
-    )
+    # Create appropriate model based on checkpoint type
+    model = create_model_from_checkpoint(checkpoint, heartbeat_input_dim, config)
     
     # Load model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -334,34 +434,32 @@ def main():
         
         print(f"\\n[{i+1}/{args.n_samples}] ECG ID: {row_meta.name}")
         
-        # Get ECG signal
+        # Get ECG signal and extract heartbeats
         ecg_signal_2d = sample['signal'].numpy()
-        ecg_signal_flat = sample['signal_flat'].numpy()
         
-        # Extract timing features
-        timing_result = extract_timing_features_with_fiducials(ecg_signal_2d, ecg_id=row_meta.name, sampling_rate=100)
-        timing_features = timing_result['features']
+        # Extract heartbeats using the new function
+        heartbeats_data = extract_heartbeats_with_timing(ecg_signal_2d, sampling_rate=100)
         
-        print(f"Timing features: PR={timing_features[0]:.0f}, QRS={timing_features[1]:.0f}, "
-              f"QT={timing_features[2]:.0f}, HR={timing_features[3]:.0f}")
+        if heartbeats_data['success']:
+            print(f"Successfully extracted {3} heartbeats from Lead II")
+            if heartbeats_data['r_peaks'] is not None and len(heartbeats_data['r_peaks']) > 0:
+                avg_hr = 60 / (np.mean(np.diff(heartbeats_data['r_peaks'])) / 100) if len(heartbeats_data['r_peaks']) > 1 else 70
+                print(f"Estimated heart rate: {avg_hr:.0f} bpm")
+        else:
+            print("Warning: Heartbeat extraction failed, using fallback data")
         
-        # Combine ECG and timing features
-        combined_input = np.concatenate([ecg_signal_flat, timing_features])
-        combined_tensor = torch.FloatTensor(combined_input).unsqueeze(0).to(device)
+        # Use heartbeats from the sample (as processed by dataset)
+        heartbeats = sample['heartbeats'].numpy()
+        heartbeats_tensor = torch.FloatTensor(heartbeats).unsqueeze(0).to(device)
         
         # Forward pass through model
         with torch.no_grad():
-            full_recon, latent = model(combined_tensor)
+            recon_heartbeats, latent = model(heartbeats_tensor)
             feature_activations = latent.squeeze(0).cpu().numpy()
 
         # Top features for highlighting
         top_indices = np.argsort(np.abs(feature_activations))[-args.top_k:][::-1]
         top_features = [(idx, feature_activations[idx]) for idx in top_indices]
-
-        # Separate k for reconstruction  
-        k_recon = args.top_k_reconstruction if args.top_k_reconstruction is not None else len(feature_activations)
-        k_recon = max(1, min(k_recon, feature_activations.shape[0]))
-        recon_indices = np.argsort(np.abs(feature_activations))[-k_recon:][::-1]
 
         print(f"Top {args.top_k} activating features:")
         for feat_idx, activation in top_features:
@@ -371,43 +469,30 @@ def main():
                 key_word = interp.get('key_word', '')
                 summary = interp.get('summary', '')
                 interpretation_info = f" | {key_word} | {summary[:60]}{'...' if len(summary) > 60 else ''}"
-            print(f"  Feature {feat_idx}: {activation:.4f}{interpretation_info}\n")
+            print(f"  Feature {feat_idx}: {activation:.4f}{interpretation_info}")
 
         # Get report
         report = str(row_meta.get('report', '')).strip()
         print(f"Clinical report: {report}")
 
-        # Reconstruct using all features (no top-k filtering)
-        with torch.no_grad():
-            if args.top_k_reconstruction is None:
-                # Use all features without filtering
-                recon_full_input = model.decode(latent, use_frozen=False)
-                print(f"Using ALL {latent.shape[1]} features for reconstruction")
-            else:
-                # Use top-k features
-                latent_subset = latent.clone()
-                mask = torch.zeros_like(latent_subset)
-                recon_indices_tensor = torch.tensor(list(recon_indices), device=latent_subset.device)
-                mask[0, recon_indices_tensor] = 1.0
-                latent_subset = latent_subset * mask
-                recon_full_input = model.decode(latent_subset, use_frozen=False)
-                print(f"Using top {k_recon} features for reconstruction")
-            recon_np = recon_full_input.squeeze(0).cpu().numpy()
-
-        recon_ecg_flat = recon_np[:ecg_signal_flat.shape[0]]
-        ecg_1d = ecg_signal_2d[:, 1] if ecg_signal_2d.shape[1] > 1 else ecg_signal_2d[:, 0]
-        n_time, n_leads = ecg_signal_2d.shape
-        recon_ecg_matrix = recon_ecg_flat.reshape(n_time, n_leads)
-        recon_lead = recon_ecg_matrix[:, 1] if n_leads > 1 else recon_ecg_matrix[:, 0]
-        mse_topk = float(np.mean((ecg_1d - recon_lead)**2))
-        print(f"Reconstruction using top {k_recon} features MSE: {mse_topk:.5f}")
+        # Calculate reconstruction MSE
+        recon_heartbeats_np = recon_heartbeats.squeeze(0).cpu().numpy()
+        mse = float(np.mean((heartbeats - recon_heartbeats_np)**2))
+        print(f"Heartbeat reconstruction MSE: {mse:.6f}")
 
         # Plot
-        save_filename = f"ecg_analysis_{row_meta.name}_{i+1}.png"
-        plot_ecg_with_features(ecg_1d, timing_result, feature_activations,
-                               top_features, report, feature_interpretations,
-                               sampling_rate=100, save_path=save_filename,
-                               recon_topk=recon_lead, mse_topk=mse_topk)
+        save_filename = f"heartbeat_analysis_{row_meta.name}_{i+1}.png"
+        plot_heartbeats_with_features(
+            heartbeats_data, 
+            feature_activations,
+            top_features, 
+            report, 
+            feature_interpretations,
+            sampling_rate=100, 
+            save_path=save_filename,
+            reconstructed_heartbeats=recon_heartbeats_np,
+            mse=mse
+        )
 
         print("-" * 60)
 

@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import pandas as pd
-import wfdb
-import ast
-from typing import Tuple, Dict, List
+import json
+from typing import Tuple, Dict, List, Optional
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -14,92 +13,67 @@ from tools.timing_extractor import get_timing_extractor
 
 
 class PTBXLDataset(Dataset):
-    """PTB-XL ECG Dataset loader.
+    """PTB-XL ECG Dataset loader that uses preprocessed cached data.
 
     """
     
-    def __init__(self, data_path: str, sampling_rate: int = 100, 
-                 normalize: bool = True, max_samples: int = None):
+    def __init__(self, preprocessed_path: str, original_data_path: Optional[str] = None, 
+                 max_samples: Optional[int] = None):
         """
-        Initialize PTB-XL dataset.
+        Initialize PTB-XL dataset from preprocessed data.
         
         Args:
-            data_path: Path to PTB-XL dataset
-            sampling_rate: Sampling rate (100 or 500 Hz)
-            normalize: Whether to apply fixed linear rescaling to [0,1]
+            preprocessed_path: Path to preprocessed data directory
+            original_data_path: Path to original PTB-XL dataset (for timing extractor)
             max_samples: Maximum number of samples to load (for testing)
-            scale_min: Assumed lower bound of ECG amplitude (mV)
-            scale_max: Assumed upper bound of ECG amplitude (mV)
         """
-        self.data_path = Path(data_path)
-        self.sampling_rate = sampling_rate
-        self.normalize = normalize
-        self.scale_min = -1.0
-        self.scale_max = 2.0        
-        # Initialize timing extractor
-        self.timing_extractor = get_timing_extractor(cache_path="times.csv", use_cache=True)
+        self.preprocessed_path = Path(preprocessed_path)
+        self.original_data_path = Path(original_data_path) if original_data_path else None
+        
+        # Load preprocessing configuration
+        with open(self.preprocessed_path / 'preprocessing_config.json', 'r') as f:
+            self.config = json.load(f)
+        
+        self.sampling_rate = self.config['sampling_rate']
+        self.normalize = self.config['normalize']
+        
+        # Initialize timing extractor if original data path is provided
+        if self.original_data_path:
+            self.timing_extractor = get_timing_extractor(cache_path="times.csv", use_cache=True)
+        else:
+            self.timing_extractor = None
+        
+        # Load cached data
+        self._load_cached_data(max_samples)
+        
+    def _load_cached_data(self, max_samples: Optional[int] = None):
+        """Load preprocessed data from cached files."""
+        print(f"Loading preprocessed ECG data from {self.preprocessed_path}...")
+        
+        # Load signals
+        self.signals = np.load(self.preprocessed_path / 'signals.npy')
+        
+        # Load heartbeats
+        self.heartbeats = np.load(self.preprocessed_path / 'heartbeats.npy')
         
         # Load metadata
-        self.metadata = pd.read_csv(
-            self.data_path / 'ptbxl_database.csv', 
-            index_col='ecg_id'
-        )
+        self.metadata = pd.read_csv(self.preprocessed_path / 'metadata.csv')
         
-        # Parse SCP codes
-        self.metadata.scp_codes = self.metadata.scp_codes.apply(
-            lambda x: ast.literal_eval(x)
-        )
+        # Set ecg_id as index for compatibility
+        if 'ecg_id' in self.metadata.columns:
+            self.metadata = self.metadata.set_index('ecg_id')
         
         # Limit samples if specified
-        if max_samples:
+        if max_samples and max_samples < len(self.signals):
+            self.signals = self.signals[:max_samples]
+            self.heartbeats = self.heartbeats[:max_samples]
             self.metadata = self.metadata.head(max_samples)
         
-        # Load ECG signals
-        self._load_signals()
-        
-    def _load_signals(self):
-        """Load ECG signals from the dataset."""
-        print(f"Loading ECG signals at {self.sampling_rate}Hz...")
-        
-        if self.sampling_rate == 100:
-            filenames = self.metadata.filename_lr
-        else:
-            filenames = self.metadata.filename_hr
-            
-        signals = []
-        valid_indices = []
-        
-        for idx, filename in enumerate(filenames):
-            try:
-                signal_path = self.data_path / filename
-                signal, _ = wfdb.rdsamp(str(signal_path))
-                signals.append(signal)
-                valid_indices.append(idx)
-            except Exception as e:
-                print(f"Error loading {filename}: {e}")
-                continue
-                
-        self.signals = np.array(signals)
-        self.metadata = self.metadata.iloc[valid_indices].reset_index(drop=True)
-        
-        if self.normalize:
-            self._normalize_signals()
-            
         print(f"Loaded {len(self.signals)} ECG signals")
         print(f"Signal shape: {self.signals.shape}")
-        
-    def _normalize_signals(self):
-        """Apply fixed linear rescaling from [scale_min, scale_max] to [0,1]."""
-        rng = (self.scale_max - self.scale_min)
-        if rng <= 0:
-            raise ValueError("scale_max must be greater than scale_min")
-        for i in range(len(self.signals)):
-            signal = self.signals[i]
-            # Linear mapping
-            scaled = (signal - self.scale_min) / rng
-            # Clip to [0,1] to avoid extreme outliers
-            scaled = np.clip(scaled, 0.0, 1.0)
-            self.signals[i] = scaled
+        print(f"Heartbeats shape: {self.heartbeats.shape}")
+        print(f"Sampling rate: {self.sampling_rate}Hz")
+        print(f"Normalized: {self.normalize}")
     
     def __len__(self):
         return len(self.signals)
@@ -107,20 +81,16 @@ class PTBXLDataset(Dataset):
     def __getitem__(self, idx):
         signal = torch.FloatTensor(self.signals[idx])
         
-        # Flatten the signal for the autoencoder
+        # Load precomputed heartbeats
+        heartbeats_tensor = torch.FloatTensor(self.heartbeats[idx])
+        
+        # Keep original signal for backward compatibility
         signal_flat = signal.flatten()
-        
-        # Extract timing features using unified extractor
-        timing_features = self._extract_timing_features(idx)
-        
-        # Combine ECG and timing features
-        combined_features = torch.cat([signal_flat, torch.FloatTensor(timing_features)])
         
         return {
             'signal': signal,
             'signal_flat': signal_flat,
-            'timing_features': torch.FloatTensor(timing_features),
-            'combined_features': combined_features,
+            'heartbeats': heartbeats_tensor,  # Precomputed simplified input
             'report': self.metadata.iloc[idx]['report'],
             'ecg_id': self.metadata.index[idx],
             'idx': idx
@@ -128,6 +98,9 @@ class PTBXLDataset(Dataset):
     
     def _extract_timing_features(self, idx: int) -> np.ndarray:
         """Extract timing features using unified extractor."""
+        if self.timing_extractor is None:
+            raise ValueError("Timing extractor not available. Provide original_data_path when initializing dataset.")
+        
         ecg_id = self.metadata.index[idx]
         signal_2d = self.signals[idx] if hasattr(self, 'signals') else None
         
@@ -144,36 +117,41 @@ class PTBXLDataset(Dataset):
     def get_flat_signal_dim(self):
         """Get the dimension of flattened ECG signals."""
         return np.prod(self.signals[0].shape)
+    
+    def get_heartbeat_dim(self):
+        """Get the dimension of simplified heartbeat input."""
+        # 3 beats * 750ms * sampling_rate/1000
+        return 3 * int(750 * self.sampling_rate / 1000)
 
 
-def create_data_loaders(data_path: str, batch_size: int = 32, 
-                       test_fold: int = 10, sampling_rate: int = 100,
-                       max_samples: int = None) -> Tuple[DataLoader, DataLoader]:
+def create_data_loaders(preprocessed_path: str, batch_size: int = 32, 
+                       test_fold: int = 10, original_data_path: Optional[str] = None,
+                       max_samples: Optional[int] = None) -> Tuple[DataLoader, DataLoader]:
     """
-    Create train and test data loaders.
+    Create train and test data loaders from preprocessed data.
     
     Args:
-        data_path: Path to PTB-XL dataset
+        preprocessed_path: Path to preprocessed data directory
         batch_size: Batch size for data loaders
         test_fold: Fold to use for testing (1-10)
-        sampling_rate: Sampling rate (100 or 500 Hz)
+        original_data_path: Path to original PTB-XL dataset (for timing features)
         max_samples: Maximum number of samples to load
         
     Returns:
-        train_loader, test_loader
+        train_loader, test_loader, dataset
     """
-    # Load full dataset
-    dataset = PTBXLDataset(data_path, sampling_rate, max_samples=max_samples)
+    # Load full dataset from preprocessed data
+    dataset = PTBXLDataset(preprocessed_path, original_data_path, max_samples=max_samples)
     
     # Split indices based on stratified folds
     train_indices = []
     test_indices = []
     
-    for idx, row in dataset.metadata.iterrows():
+    for pos_idx, (idx, row) in enumerate(dataset.metadata.iterrows()):
         if row['strat_fold'] == test_fold:
-            test_indices.append(idx)
+            test_indices.append(pos_idx)
         else:
-            train_indices.append(idx)
+            train_indices.append(pos_idx)
     
     # Create subset datasets
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
@@ -184,16 +162,16 @@ def create_data_loaders(data_path: str, batch_size: int = 32,
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,
+        pin_memory=False
     )
     
     test_loader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,
+        pin_memory=False
     )
     
     print(f"Train samples: {len(train_dataset)}")
@@ -203,24 +181,36 @@ def create_data_loaders(data_path: str, batch_size: int = 32,
 
 
 if __name__ == "__main__":
-    # Test the dataset loader
-    data_path = "physionet.org/files/ptb-xl/1.0.3/"
+    # Test the dataset loader with preprocessed data
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Test the data loader with preprocessed data')
+    parser.add_argument('--preprocessed_path', type=str, required=True,
+                        help='Path to preprocessed data directory')
+    parser.add_argument('--original_data_path', type=str, default=None,
+                        help='Path to original PTB-XL dataset')
+    parser.add_argument('--max_samples', type=int, default=100,
+                        help='Maximum samples for testing')
+    
+    args = parser.parse_args()
     
     # Create a small test dataset
-    dataset = PTBXLDataset(data_path, max_samples=100)
+    dataset = PTBXLDataset(args.preprocessed_path, args.original_data_path, max_samples=args.max_samples)
     
     # Print some statistics
     print(f"Dataset size: {len(dataset)}")
     print(f"Signal shape: {dataset.get_signal_shape()}")
     print(f"Flat signal dimension: {dataset.get_flat_signal_dim()}")
+    print(f"Heartbeat dimension: {dataset.get_heartbeat_dim()}")
     
     # Test data loader
     train_loader, test_loader, _ = create_data_loaders(
-        data_path, batch_size=4, max_samples=100
+        args.preprocessed_path, batch_size=4, original_data_path=args.original_data_path, max_samples=args.max_samples
     )
     
     # Get a sample batch
     batch = next(iter(train_loader))
     print(f"Batch signal shape: {batch['signal'].shape}")
     print(f"Batch flat signal shape: {batch['signal_flat'].shape}")
+    print(f"Batch heartbeats shape: {batch['heartbeats'].shape}")
     print(f"Sample report: {batch['report'][0]}")

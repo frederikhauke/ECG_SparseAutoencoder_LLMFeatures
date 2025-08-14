@@ -9,13 +9,13 @@
   },
   
   "model": {
-    "type": "sparse",
+    "type": "simple",
     "hidden_dims": [512, 256],
     "latent_dim": 128,
-    "sparsity_weight": 0.01,
-    "alpha_aux": 0.02,
-    "target_sparsity": 0.1,
-    "use_frozen_decoder_for_aux": true,
+    "sparsity_weight": 0.0,
+    "alpha_aux": 0.0,
+    "target_sparsity": 0.0,
+    "use_frozen_decoder_for_aux": false,
     "k_frozen_update": 200
   },
   

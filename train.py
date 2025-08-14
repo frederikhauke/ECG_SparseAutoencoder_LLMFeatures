@@ -10,17 +10,18 @@ from typing import Dict, List
 
 from data_loader import create_data_loaders
 from sparse_autoencoder import GatedSparseAutoencoder
+from simple_autoencoder import SimpleAutoencoder
 
 
-class ECGSparseAutoencoderTrainer:
-    """Trainer for ECG Gated Sparse Autoencoder."""
+class ECGAutoencoderTrainer:
+    """Trainer for ECG Autoencoders (both sparse and simple)."""
     
-    def __init__(self, model: GatedSparseAutoencoder, device: str = 'cuda'):
+    def __init__(self, model, device: str = 'cuda'):
         """
         Initialize the trainer.
         
         Args:
-            model: SparseAutoencoder model
+            model: Autoencoder model (GatedSparseAutoencoder or SimpleAutoencoder)
             device: Device for training ('cuda' or 'cpu')
         """
         self.model = model
@@ -45,7 +46,7 @@ class ECGSparseAutoencoderTrainer:
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
 
         for step, batch in enumerate(pbar, start=1):
-            x = batch['combined_features'].to(self.device)  # Use combined ECG + timing features
+            x = batch['heartbeats'].to(self.device)  # Use simplified heartbeats
             
             optimizer.zero_grad()
             
@@ -89,7 +90,7 @@ class ECGSparseAutoencoderTrainer:
         
         with torch.no_grad():
             for batch in val_loader:
-                x = batch['combined_features'].to(self.device)
+                x = batch['heartbeats'].to(self.device)  # Use simplified heartbeats
                 losses = self.model.loss(x, lambda_sparsity=self.model.sparsity_weight)
                 total_loss += losses['loss'].item()
                 total_recon_loss += losses['L_recon'].item()
@@ -188,16 +189,13 @@ class ECGSparseAutoencoderTrainer:
                     'train_loss': float(train_metrics['total_loss']),
                     'val_loss': float(val_metrics['total_loss']),
                     'model_config': {
-                        'ecg_input_dim': int(self.model.ecg_input_dim),
-                        'timing_features_dim': int(self.model.timing_features_dim),
-                        'input_dim': int(self.model.input_dim),
+                        'heartbeat_input_dim': int(self.model.input_dim),
                         'latent_dim': int(self.model.latent_dim),
                         'sparsity_weight': float(self.model.sparsity_weight),
                         'alpha_aux': float(self.model.alpha_aux),
                         'target_sparsity': float(self.model.target_sparsity),
                         'use_frozen_decoder_for_aux': bool(self.model.use_frozen_decoder_for_aux),
-                        'hidden_dims': [2048, 1024, 512],  # Default hidden dims
-                        'dropout_rate': 0.2
+                        'hidden_dims': self.model.hidden_dims
                     }
                 }, save_path / 'best_model.pth')
                 
@@ -314,7 +312,7 @@ def load_config(config_path: str = 'config.json') -> dict:
 def main():
     """Main training function."""
     # Load configuration from config.json
-    config = load_config('config.json')
+    config = load_config('config_simple.json')
     print("Loaded configuration:")
     for key, value in config.items():
         print(f"  {key}: {value}")
@@ -326,36 +324,42 @@ def main():
     # Create data loaders
     print("Loading data...")
     train_loader, val_loader, dataset = create_data_loaders(
-        data_path=config['data_path'],
+        preprocessed_path=config.get('preprocessed_path', 'preprocessed_data'),
         batch_size=config['batch_size'],
         test_fold=config['test_fold'],
-        sampling_rate=config['sampling_rate'],
+        original_data_path=config.get('data_path'),
         max_samples=config['max_samples']
     )
     
     # Get input dimensions from dataset
-    ecg_input_dim = dataset.get_flat_signal_dim()  # 12 * 1000 = 12000
-    timing_features_dim = 4  # PR, QRS, QT, HR
-    total_input_dim = ecg_input_dim + timing_features_dim
-    print(f"ECG input dim: {ecg_input_dim}, Timing features dim: {timing_features_dim}")
-    print(f"Total input dimension: {total_input_dim}")
+    heartbeat_input_dim = dataset.get_heartbeat_dim()  # 3 beats * 750ms * sampling_rate/1000
+    print(f"Heartbeat input dimension: {heartbeat_input_dim}")
     
-    # Create model with all config parameters
-    model = GatedSparseAutoencoder(
-        ecg_input_dim=ecg_input_dim,
-        timing_features_dim=timing_features_dim,
-        hidden_dims=config['hidden_dims'],
-        latent_dim=config['latent_dim'],
-        sparsity_weight=config['sparsity_weight'],
-        alpha_aux=config.get('alpha_aux', 0.02),
-        target_sparsity=config['target_sparsity'],
-        use_frozen_decoder_for_aux=config.get('use_frozen_decoder_for_aux', True)
-    )
+    # Create model based on type
+    model_type = config.get('type', 'sparse').lower()
+    print(f"Creating {model_type} autoencoder...")
+    
+    model_args = {
+        'heartbeat_input_dim': heartbeat_input_dim,
+        'hidden_dims': config['hidden_dims'],
+        'latent_dim': config['latent_dim'],
+        'sparsity_weight': config.get('sparsity_weight', 0.01),
+        'alpha_aux': config.get('alpha_aux', 0.02),
+        'target_sparsity': config.get('target_sparsity', 0.1),
+        'use_frozen_decoder_for_aux': config.get('use_frozen_decoder_for_aux', True)
+    }
+    
+    if model_type == 'simple':
+        model = SimpleAutoencoder(**model_args)
+    elif model_type == 'sparse':
+        model = GatedSparseAutoencoder(**model_args)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Use 'simple' or 'sparse'.")
     
     print(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create trainer
-    trainer = ECGSparseAutoencoderTrainer(model, device)
+    trainer = ECGAutoencoderTrainer(model, device)
     
     # Train model
     trainer.train(

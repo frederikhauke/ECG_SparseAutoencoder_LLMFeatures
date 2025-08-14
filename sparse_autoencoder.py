@@ -11,17 +11,15 @@ def col_norms(matrix: Tensor, eps=1e-8) -> Tensor:
     return torch.sqrt((matrix ** 2).sum(dim=0) + eps)
 
 class GatedSparseAutoencoder(nn.Module):
-    """Gated Sparse Autoencoder for ECG + timing features.
+    """Gated Sparse Autoencoder for simplified ECG heartbeats.
 
-    Change: auxiliary loss weight reduced (alpha_aux default 0.02) and made configurable.
+    Modified to work with 3 representative heartbeats from lead II only.
     """
-    def __init__(self, ecg_input_dim: int, timing_features_dim: int, hidden_dims: list, latent_dim: int,
+    def __init__(self, heartbeat_input_dim: int, hidden_dims: list, latent_dim: int,
                  sparsity_weight: float = 0.01, use_frozen_decoder_for_aux: bool = True,
                  alpha_aux: float = 0.1, target_sparsity: float = 0.5):
         super().__init__()
-        self.ecg_input_dim = ecg_input_dim
-        self.timing_features_dim = timing_features_dim
-        self.input_dim = ecg_input_dim + timing_features_dim
+        self.input_dim = heartbeat_input_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.sparsity_weight = sparsity_weight  # For config and trainer access
@@ -150,7 +148,7 @@ class GatedSparseAutoencoder(nn.Module):
         activations = []
         with torch.no_grad():
             for batch in dataloader:
-                x = batch['signal_flat'].to(device)
+                x = batch['heartbeats'].to(device)  # Use simplified heartbeats
                 _, h = self.forward(x)
                 activations.append(h.cpu().numpy())
         return np.vstack(activations)
@@ -171,7 +169,7 @@ class ECGFeatureAnalyzer:
         sample_indices = []
         with torch.no_grad():
             for batch in dataloader:
-                x = batch['signal_flat'].to(self.device)
+                x = batch['heartbeats'].to(self.device)  # Use simplified heartbeats
                 _, h = self.model(x)
                 feature_acts = h[:, feature_idx].cpu().numpy()
                 activations.extend(feature_acts)
@@ -202,24 +200,22 @@ class ECGFeatureAnalyzer:
         }
 
 if __name__ == "__main__":
-    # Test the gated sparse autoencoder with ECG + timing features
-    ecg_input_dim = 12 * 1000  # 12 leads, 1000 time points
-    timing_features_dim = 4    # PR, QRS, QT, HR
-    hidden_dims = [2048, 1024, 512]
-    latent_dim = 256
+    # Test the gated sparse autoencoder with simplified heartbeats
+    heartbeat_input_dim = 3 * 75  # 3 beats * 750ms * 0.1 samples/ms (100Hz)
+    hidden_dims = [512, 256]
+    latent_dim = 128
     model = GatedSparseAutoencoder(
-        ecg_input_dim=ecg_input_dim,
-        timing_features_dim=timing_features_dim,
+        heartbeat_input_dim=heartbeat_input_dim,
         hidden_dims=hidden_dims,
         latent_dim=latent_dim
     )
     batch_size = 4
-    combined_input = torch.randn(batch_size, ecg_input_dim + timing_features_dim)
-    x_hat, h = model(combined_input)
-    losses = model.loss(combined_input, lambda_sparsity=0.01)
+    heartbeat_input = torch.randn(batch_size, heartbeat_input_dim)
+    x_hat, h = model(heartbeat_input)
+    losses = model.loss(heartbeat_input, lambda_sparsity=0.01)
     print(f"Model created successfully!")
-    print(f"ECG input dim: {ecg_input_dim}, Timing features dim: {timing_features_dim}")
-    print(f"Combined input shape: {combined_input.shape}")
+    print(f"Heartbeat input dim: {heartbeat_input_dim}")
+    print(f"Input shape: {heartbeat_input.shape}")
     print(f"Latent shape: {h.shape}")
     print(f"Reconstruction shape: {x_hat.shape}")
     print(f"Total loss: {losses['loss'].item():.4f}")

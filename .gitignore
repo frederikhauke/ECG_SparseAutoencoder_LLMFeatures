@@ -31,6 +31,9 @@ plots/
 # Dataset (PhysioNet PTB-XL local mirror)
 physionet.org/
 
+# Preprocessed data cache
+preprocessed_data/
+
 # Large data exports
 *.csv
 !times.csv  # Keep specific timing CSV if needed
